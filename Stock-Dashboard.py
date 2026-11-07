@@ -1029,7 +1029,7 @@ def _switch(items):
     if len(items) < 2:
         return "", items[0][1] if items else ""
     opts = "".join(f'<option value="{i}">{_esc(label)}</option>' for i, (label, _) in enumerate(items))
-    blocks = "".join(f'<div class="ublk" data-u="{i}"{"" if i == 0 else " style=\"display:none\""}>{h}</div>'
+    blocks = "".join(f'<div class="ublk" data-u="{i}"{" style=\"display:none\"" if i != 0 else ""}>{h}</div>'
                      for i, (_, h) in enumerate(items))
     return f'<select class="usel" onchange="{_SWITCH_JS}">{opts}</select>', blocks
 
