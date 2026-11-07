@@ -1,0 +1,48 @@
+name: Breadth Dashboard
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: '30 13 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Downloaded Data
+        uses: actions/cache@v4
+        with:
+          path: .breadth_cache
+          key: breadth-cache-v1
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Dashboard
+        run: |
+          python Stock-Dashboard.py
+
+      - name: Commit Generated Dashboard
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add docs/index.html
+
+          git diff --staged --quiet || git commit -m "Auto update dashboard"
+
+          git push
