@@ -181,7 +181,7 @@ def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     paths = {k: os.path.join(CACHE_DIR, f"{k}{'_' + tag if tag else ''}_{period}.csv.gz")
-             for k in ("closes", "volumes")}
+             for k in ("closes", "volumes", "opens", "highs", "lows")}   # o/h/l feed the Manas screener
     fresh = all(_prices_fresh(p) for p in paths.values())
     if fresh and not refresh:
         if verbose:
@@ -195,6 +195,7 @@ def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True
               f"(one-off; cached for the rest of the day)...")
 
     close_frames, volume_frames = [], []
+    ohl_frames = {"Open": [], "High": [], "Low": []}
     for n, batch in enumerate(_chunks(tickers, batch_size), 1):
         data = None
         for attempt in (1, 2):
@@ -209,8 +210,10 @@ def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True
         if data is None or data.empty:
             continue
         multi = isinstance(data.columns, pd.MultiIndex)
-        close_frames.append(data["Close"] if multi else data[["Close"]])
-        volume_frames.append(data["Volume"] if multi else data[["Volume"]])
+        close_frames.append(data["Close"] if multi else data[["Close"]].set_axis(batch, axis=1))
+        volume_frames.append(data["Volume"] if multi else data[["Volume"]].set_axis(batch, axis=1))
+        for k in ohl_frames:
+            ohl_frames[k].append(data[k] if multi else data[[k]].set_axis(batch, axis=1))
         if verbose:
             print(f"  batch {n}: {close_frames[-1].shape[1]} symbols", flush=True)
 
@@ -220,6 +223,10 @@ def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True
     volumes = volumes.loc[:, ~volumes.columns.duplicated()].reindex(index=closes.index, columns=closes.columns)
     closes.to_csv(paths["closes"])
     volumes.to_csv(paths["volumes"])
+    for k, key in (("Open", "opens"), ("High", "highs"), ("Low", "lows")):
+        f = pd.concat(ohl_frames[k], axis=1).sort_index()
+        f = f.loc[:, ~f.columns.duplicated()].reindex(index=closes.index, columns=closes.columns)
+        f.to_csv(paths[key])
     if verbose:
         print(f"Cached {closes.shape[1]} tickers x {closes.shape[0]} days")
     return _drop_partial_sessions(closes, volumes)
@@ -248,6 +255,37 @@ def load_index(ticker="^NSEI", period="2y", refresh=False):
 # ---------------------------------------------------------------------------
 # 4. Breadth
 # ---------------------------------------------------------------------------
+def load_ohl(period="2y", tag=""):
+    """(opens, highs, lows) saved by load_prices for the same period / tag; None if missing."""
+    out = []
+    for key in ("opens", "highs", "lows"):
+        path = os.path.join(CACHE_DIR, f"{key}{'_' + tag if tag else ''}_{period}.csv.gz")
+        if not os.path.exists(path):
+            return None
+        out.append(pd.read_csv(path, index_col=0, parse_dates=True))
+    return tuple(out)
+
+
+def load_index_ohlc(ticker="^NSEI", period="2y", refresh=False):
+    """Daily Open / High / Low / Close for an index, cached; None on failure."""
+    path = os.path.join(CACHE_DIR, f"index_ohlc_{ticker.lstrip('^')}_{period}.csv.gz")
+    if _prices_fresh(path) and not refresh:
+        return pd.read_csv(path, index_col=0, parse_dates=True)
+    try:
+        df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open", "High", "Low", "Close"]].dropna(subset=["Close"])
+        if df.empty:
+            raise ValueError("no rows returned")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        df.to_csv(path)
+        return df
+    except Exception as e:
+        print(f"  [warn] {ticker} OHLC unavailable: {e}", file=sys.stderr)
+        return None
+
+
 def compute_breadth(closes, min_stocks=20):
     valid = closes.notna()
     out = pd.DataFrame(index=closes.index)
@@ -1075,6 +1113,199 @@ RVOL_COLUMNS = [("ticker", "Ticker"), ("rvol_date", "Spike Date"), ("rvol_pct", 
                 ("pct_from_52w_high", "Off High"), ("days_ago", "Age")]
 
 
+# ---------------------------------------------------------------------------
+# 7b. Manas Arora screener (Minervini-style swing set-ups, daily-chart version)
+# ---------------------------------------------------------------------------
+def run_manas_screener(closes, volumes, opens, highs, lows, min_price=30.0, near_high_pct=25.0,
+                       above_low_pct=50.0, purple_move=0.05, purple_volume=1_000_000, prior_run_pct=50.0,
+                       tight_range_pct=3.0, max_ema_dist_pct=5.0, pullback_min_pct=4.0, pullback_max_pct=20.0,
+                       breakout_vol_x=1.5, pre_breakout_pct=3.0, base_range_pct=10.0, **_):
+    """(tables {name: DataFrame}, frames {ticker: OHLCV}) for the latest session.
+
+    Built from secondhand write-ups of Manas Arora's process (his own posts on X could not be read);
+    intraday parts are approximated from daily bars: "strong start" = opened above yesterday's high,
+    closed above the open, on more volume than yesterday.
+    Trend filter (his interview template): close > min_price, within near_high_pct of the 52-week high,
+    close > 50 SMA > 200 SMA, 200 SMA rising for 3 months, >= above_low_pct above the 52-week low,
+    52-week high made in the last 6 months.
+    """
+    C, O, H, L = closes, opens.reindex_like(closes), highs.reindex_like(closes), lows.reindex_like(closes)
+    V = volumes.reindex_like(closes)
+    C, O, H, L, V = (x.iloc[-320:] for x in (C, O, H, L, V))
+    sma20, sma50 = C.rolling(20).mean(), C.rolling(50).mean()
+    sma200 = C.rolling(200, min_periods=190).mean()
+    ema21 = C.ewm(span=21, adjust=False).mean()
+    hi52, lo52 = H.rolling(252, min_periods=200).max(), L.rolling(252, min_periods=200).min()
+    template = ((C > min_price) & (C >= hi52 * (1 - near_high_pct / 100)) & (C > sma50) & (sma50 > sma200)
+                & (sma200 > sma200.shift(63)) & (sma200 > sma200.shift(21))
+                & (C >= lo52 * (1 + above_low_pct / 100)) & (H.rolling(126).max() >= hi52 * 0.999))
+    avg_v = V.shift(1).rolling(20).mean()
+    rng = (H - L) / C * 100
+    avg_rng = rng.shift(1).rolling(20).mean()
+    pos = ((C - L) / (H - L).replace(0, np.nan)).fillna(0.5)            # where it closed in the day's range
+    ret = C / C.shift(1) - 1
+    purple = ((ret >= purple_move) & (V >= purple_volume)).astype(int)    # his "purple dot": fast mover day
+    purple60 = purple.rolling(60, min_periods=1).max() > 0
+    run = (C.rolling(60).max() / L.rolling(126, min_periods=60).min() - 1) * 100
+    inside = (H <= H.shift(1)) & (L >= L.shift(1))
+    ema_dist = (C / ema21 - 1) * 100
+    strong = (O > H.shift(1)) & (C > O) & (V > V.shift(1))
+    shifted = lambda x: x.shift(1, fill_value=False).astype(bool)
+
+    # 1. contraction (SVRO): prior run + purple dot, tight inside days just above the 21 EMA
+    svro = (template & purple60 & (run >= prior_run_pct) & (rng.rolling(3).mean() <= tight_range_pct)
+            & (rng.rolling(3).max() <= tight_range_pct + 1) & (inside | shifted(inside))
+            & (ema_dist >= 0) & (ema_dist <= max_ema_dist_pct))
+    svro_go = shifted(svro) & strong
+    # 2. 21 EMA pullback (2A)
+    depth = (1 - C / H.rolling(15).max()) * 100
+    zone = (L <= ema21 * 1.02) & (C >= ema21 * 0.98) & (C > sma50)
+    pull = template & zone & (depth >= pullback_min_pct) & (depth <= pullback_max_pct)
+    pull_dry = pull & (V.rolling(3).mean() < 0.8 * avg_v)
+    ss = shifted(pull) & strong & template
+    sv = pull & (V >= 1.5 * avg_v) & (rng <= 0.75 * avg_rng) & (pos >= 0.5)
+    cv = (template & (L <= ema21) & (C > sma50) & (depth >= pullback_min_pct) & (V >= 2.5 * avg_v)
+          & (rng >= 1.5 * avg_rng) & (pos >= 0.6))
+    # 3. consolidation breakout / 4. pre-breakout
+    hi20 = H.shift(1).rolling(20).max()
+    bo = template & (C > hi20) & (V >= breakout_vol_x * avg_v) & (pos >= 0.67)
+    base10 = (H.rolling(10).max() - L.rolling(10).min()) / C * 100
+    pre = (template & (C >= hi20 * (1 - pre_breakout_pct / 100)) & (C <= hi20) & (base10 <= base_range_pct)
+           & (C > sma20))
+
+    d = C.index[-1]
+    last = lambda x: x.loc[d]
+
+    def table(mask, trigger, kind, level=None):
+        t = last(mask)
+        names = t[t.fillna(False).astype(bool)].index
+        rows = []
+        for n in names:
+            c, lo_, hi_ = C.at[d, n], L.at[d, n], H.at[d, n]
+            lv = level.at[d, n] if level is not None else hi_
+            stop = lo_
+            rows.append({"ticker": n.removesuffix(".NS"), "close": c,
+                         "day_change_pct": ret.at[d, n] * 100,
+                         "trigger": trigger(n) if callable(trigger) else trigger,
+                         "vol_x": V.at[d, n] / avg_v.at[d, n] if avg_v.at[d, n] else np.nan,
+                         "range_pct": rng.at[d, n], "ema21_dist_pct": ema_dist.at[d, n],
+                         "off_high_pct": (c / hi52.at[d, n] - 1) * 100, "run_pct": run.at[d, n],
+                         "trigger_level": lv if kind == "watch" else np.nan,
+                         "to_trigger_pct": (lv / c - 1) * 100 if kind == "watch" else np.nan,
+                         "stop": stop, "risk_pct": (c - stop) / c * 100 if kind == "go" else
+                         (lv - stop) / lv * 100})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        return df.sort_values("vol_x" if kind == "go" else "to_trigger_pct",
+                              ascending=kind != "go").reset_index(drop=True)
+
+    tag2a = lambda n: " + ".join(k for k, m in (("Strong start", ss), ("Stop volume", sv),
+                                                 ("Climax volume", cv)) if bool(m.at[d, n]))
+    tables = {
+        "svro_go": table(svro_go, "Strong start from contraction", "go"),
+        "svro_watch": table(svro & ~svro_go, "Coiling", "watch"),
+        "pb_go": table(ss | sv | cv, tag2a, "go"),
+        "pb_watch": table(pull_dry & ~(ss | sv | cv), "Pulling back, volume drying", "watch"),
+        "bo_go": table(bo, "Breakout", "go"),
+        "pre_watch": table(pre & ~bo, "Tight base", "watch", level=hi20),
+    }
+    # funnel for the run log: how many stocks survive each filter on the latest session
+    cnt = lambda mask: int(mask.loc[d].fillna(False).astype(bool).sum())
+    tmpl = template.loc[d].fillna(False).astype(bool)
+    print("Manas screener funnel (latest session):")
+    for label, n in (("stocks with a close", int(C.loc[d].notna().sum())),
+                     ("pass trend filter", int(tmpl.sum())),
+                     ("  + purple dot in 60 days", cnt(template & purple60)),
+                     ("  + prior run >= %g%%" % prior_run_pct, cnt(template & purple60 & (run >= prior_run_pct))),
+                     ("  + tight 3 days", cnt(template & purple60 & (run >= prior_run_pct)
+                                              & (rng.rolling(3).mean() <= tight_range_pct))),
+                     ("  SVRO setting up / triggered", f"{cnt(svro & ~svro_go)} / {cnt(svro_go)}"),
+                     ("  at 21 EMA, 4-20% pullback", cnt(pull)),
+                     ("  2A setting up (volume drying)", cnt(pull_dry & ~(ss | sv | cv))),
+                     ("  2A triggered: strong start / stop vol / climax vol",
+                      f"{cnt(ss)} / {cnt(sv)} / {cnt(cv)}"),
+                     ("  breakouts today", cnt(bo)),
+                     ("  pre-breakout (tight base)", cnt(pre & ~bo))):
+        print(f"  {label:<52} {n}")
+    names = {t + ".NS" for df in tables.values() if not df.empty for t in df["ticker"]}
+    frames = {n.removesuffix(".NS"): pd.DataFrame({"Open": opens[n], "High": highs[n], "Low": lows[n],
+                                                   "Close": closes[n], "Volume": volumes[n]}).dropna()
+              for n in names if n in closes.columns}
+    return tables, frames
+
+
+MANAS_COLUMNS = [("ticker", "Ticker"), ("trigger", "Trigger"), ("close", "Close"), ("day_change_pct", "Day"),
+                 ("vol_x", "Vol x avg"), ("range_pct", "Range"), ("ema21_dist_pct", "vs 21 EMA"),
+                 ("run_pct", "Prior run"), ("off_high_pct", "Off 52w high"), ("trigger_level", "Trigger above"),
+                 ("to_trigger_pct", "To trigger"), ("stop", "Stop (day low)"), ("risk_pct", "Risk")]
+
+
+def _manas_fmt(key, v):
+    if _missing(v):
+        return "-"
+    if key in ("close", "trigger_level", "stop"):
+        return f"{float(v):,.2f}"
+    if key == "vol_x":
+        return f"{float(v):.1f}x"
+    if key in ("day_change_pct", "ema21_dist_pct", "off_high_pct", "to_trigger_pct"):
+        return f"{float(v):+.1f}%"
+    if key in ("range_pct", "risk_pct"):
+        return f"{float(v):.1f}%"
+    if key == "run_pct":
+        return f"{float(v):,.0f}%"
+    return str(v)
+
+
+def _manas_tab(tables, frames, cfg, market_note=""):
+    intro = ('<h2>Manas Arora set-ups</h2><p class="secsub">Minervini-style swing set-ups as Manas Arora '
+             'describes them, screened on daily bars across all NSE stocks that pass his trend filter (close '
+             f'above &#8377;{cfg.get("min_price", 30):.0f}, within {cfg.get("near_high_pct", 25):.0f}% of the '
+             '52-week high, close &gt; 50 SMA &gt; 200 SMA, 200 SMA rising 3 months, 50%+ above the 52-week '
+             'low, 52-week high in the last 6 months). Rules come from secondhand write-ups of his posts and '
+             'interviews; his intraday checks (opening range, first-minutes volume) are approximated: '
+             '<i>strong start</i> = opened above yesterday&rsquo;s high and closed green on more volume.</p>'
+             + (f'<div class="card note" style="margin-bottom:6px">{market_note}</div>' if market_note else ""))
+    groups = [
+        ("Contraction breakout (SVRO) &middot; triggered today", "svro_go",
+         "Prior 50%+ run with a purple-dot day (5%+ on 1M+ shares), tight inside days 0-5% above the 21 EMA, "
+         "then a strong start."),
+        ("Contraction (SVRO) &middot; setting up", "svro_watch",
+         "Coiling now. Trigger = a strong start above today's high; stop = today's low."),
+        ("21 EMA pullback (2A) &middot; triggered today", "pb_go",
+         "Strong start = bounce off the EMA; Stop volume = heavy volume on a narrow bar at the EMA (enter next "
+         "open); Climax volume = wide, heavy washout through the EMA that closed off the lows."),
+        ("21 EMA pullback (2A) &middot; setting up", "pb_watch",
+         "4-20% off the 15-day high, at the 21 EMA, volume drying up."),
+        ("Consolidation breakout &middot; triggered today", "bo_go",
+         f"Closed above the 20-day high on {cfg.get('breakout_vol_x', 1.5):g}x+ average volume, in the top third "
+         "of the day's range."),
+        ("Pre-breakout (tight base) &middot; setting up", "pre_watch",
+         f"Within {cfg.get('pre_breakout_pct', 3):g}% of the 20-day high, 10-day range "
+         f"{cfg.get('base_range_pct', 10):g}% or less, above the 20 MA. Trigger = the 20-day high."),
+    ]
+    order = ["svro_go", "pb_go", "bo_go", "svro_watch", "pb_watch", "pre_watch"]   # charts: triggers first
+    seen, chart_rows = set(), []
+    for key in order:
+        df = tables.get(key, pd.DataFrame())
+        for _, r in df.iterrows():
+            if r["ticker"] not in seen:
+                seen.add(r["ticker"])
+                chart_rows.append(r)
+    chart_df = pd.DataFrame(chart_rows)
+
+    def annotate(r):
+        lv = [(r["stop"], "#d32f2f", "Stop (day low)")]
+        if not _missing(r.get("trigger_level")):
+            lv.append((r["trigger_level"], "#2e7d32", "Trigger"))
+        return dict(title=f"{r['ticker']}  |  {r['trigger']}  |  close {r['close']:,.2f}", levels=lv)
+
+    charts, links = _charts(chart_df, frames, cfg, "manas", annotate) if not chart_df.empty else ("", {})
+    body = "".join(_section(t.replace("&middot;", "-"), tables.get(k, pd.DataFrame()), MANAS_COLUMNS,
+                            _manas_fmt, sub, links) for t, k, sub in groups)
+    return intro + body + charts
+
+
 def _rvol_fmt(key, v):
     if _missing(v):
         return "-"
@@ -1203,7 +1434,7 @@ function fn(v,dp){return ok(v)?v.toLocaleString('en-IN',{minimumFractionDigits:d
 function info(box,D,i){var s=D.s[i],tag=s===2?['Turning up?','pos']:s===-2?['Turning down?','neg']:s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
  box.querySelector('.mminfo').innerHTML='<b>'+fd(D.d[i])+'</b> &middot; <b class="'+tag[1]+'">'+tag[0]+'</b>'
   +(ok(D.sc[i])?' <span class="dim">(score '+fn(D.sc[i])+')</span>':'')
-  +' &middot; Nifty '+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
+  +' &middot; Nifty '+(box.dataset.mode==='candle'&&D.o&&ok(D.o[i])?'O '+fn(D.o[i],0)+' H '+fn(D.h[i],0)+' L '+fn(D.l[i],0)+' C ':'')+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
   +' <span class="dim">(thrust '+fn(D.tu[i])+' / '+fn(D.td[i])+')</span> &middot; 5d '+fn(D.r5[i],2)+' &middot; 10d '+fn(D.r10[i],2)
   +' &middot; T2108 '+fn(D.t[i],1)
   +(box._cv&&box._b0!==null&&ok(box._cv(i))?'<br><span class="dim">Since '+fd(D.d[box._b0])+': Nifty 50 '
@@ -1223,7 +1454,9 @@ function draw(box,D,span){
  if(C){for(var i=i0;i<N;i++){if(ok(C[i])&&ok(D.ix[i])){b0=i;break;}}if(b0!==null)base=D.ix[b0]/C[b0];}
  function CV(i){return (base!==null&&ok(C[i]))?C[i]*base:null;}
  box._cv=CV;box._b0=b0;
- var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){[D.ix[i],CV(i)].forEach(function(v){if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}});}
+ var CD=box.dataset.mode==='candle'&&D.o&&D.h&&D.l;
+ function okc(i){return CD&&ok(D.o[i])&&ok(D.h[i])&&ok(D.l[i])&&ok(D.ix[i]);}
+ var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){[D.ix[i],CV(i),okc(i)?D.h[i]:null,okc(i)?D.l[i]:null].forEach(function(v){if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}});}
  if(!(hi>lo)){lo=0;hi=1;}var pad=(hi-lo)*0.12;lo-=pad;hi+=pad;
  function Y(v){return T+(1-(v-lo)/(hi-lo))*PH;}
  // background = daily verdict
@@ -1240,12 +1473,18 @@ function draw(box,D,span){
  var d='';for(var i=i0;i<N;i++){if(ok(D.ix[i]))d+=(d?'L':'M')+X(i).toFixed(1)+','+Y(D.ix[i]).toFixed(1);}
  if(base!==null){var dc='';for(var i=i0;i<N;i++){var v=CV(i);if(ok(v))dc+=(dc?'L':'M')+X(i).toFixed(1)+','+Y(v).toFixed(1);}
    mk(svg,'path',{d:dc,fill:'none',stroke:'#ea580c','stroke-width':1.6,'stroke-dasharray':'5,3'});}
- mk(svg,'path',{d:d,fill:'none',stroke:'#111827','stroke-width':1.8});
- // thrust days: triangles above (buying) / below (selling) the line
+ if(CD){var bw=Math.max(1,Math.min(10,step*0.66));        // neutral candles: hollow up, filled down
+   for(var i=i0;i<N;i++){if(!okc(i))continue;var x=X(i),o=D.o[i],c=D.ix[i],up=c>=o;
+     mk(svg,'line',{x1:x,x2:x,y1:Y(D.h[i]),y2:Y(D.l[i]),stroke:'#374151','stroke-width':1});
+     var yt=Y(Math.max(o,c)),yb=Y(Math.min(o,c));
+     mk(svg,'rect',{x:x-bw/2,y:yt,width:bw,height:Math.max(1,yb-yt),fill:up?'#ffffff':'#374151',stroke:'#374151','stroke-width':1});}}
+ else mk(svg,'path',{d:d,fill:'none',stroke:'#111827','stroke-width':1.8});
+ // thrust days: buying below the candle low (or the line), selling above the high
  var sz=Math.max(4,Math.min(7,step*0.9));
- for(var i=i0;i<N;i++){if(!ok(D.ix[i]))continue;var x=X(i),y=Y(D.ix[i]),u=D.up[i],dn=D.dn[i];
-   if(ok(D.tu[i])&&u>dn&&u>=D.tu[i])mk(svg,'path',{d:'M'+x+','+(y+6)+'l'+(-sz)+','+(sz*1.6)+'h'+(2*sz)+'z',fill:'#15803d'});
-   if(ok(D.td[i])&&dn>u&&dn>=D.td[i])mk(svg,'path',{d:'M'+x+','+(y-6)+'l'+(-sz)+','+(-sz*1.6)+'h'+(2*sz)+'z',fill:'#b91c1c'});}
+ for(var i=i0;i<N;i++){if(!ok(D.ix[i]))continue;var x=X(i),u=D.up[i],dn=D.dn[i];
+   var yl=Y(okc(i)?D.l[i]:D.ix[i]),yh=Y(okc(i)?D.h[i]:D.ix[i]);
+   if(ok(D.tu[i])&&u>dn&&u>=D.tu[i])mk(svg,'path',{d:'M'+x+','+(yl+5)+'l'+(-sz)+','+(sz*1.6)+'h'+(2*sz)+'z',fill:'#15803d'});
+   if(ok(D.td[i])&&dn>u&&dn>=D.td[i])mk(svg,'path',{d:'M'+x+','+(yh-5)+'l'+(-sz)+','+(-sz*1.6)+'h'+(2*sz)+'z',fill:'#b91c1c'});}
  mk(svg,'rect',{x:L,y:T,width:PW,height:PH,fill:'none',stroke:'#e5e7eb'});
  // hover
  var cross=mk(svg,'line',{x1:0,x2:0,y1:T,y2:T+PH,stroke:'#111827',opacity:0});
@@ -1260,6 +1499,10 @@ document.querySelectorAll('.mmc').forEach(function(box){
  var D=JSON.parse(box.dataset.d),btns=box.querySelectorAll('.mmrng button');
  btns.forEach(function(b){b.addEventListener('click',function(){btns.forEach(function(x){x.classList.toggle('on',x===b);});
    box._span=+b.dataset.n;draw(box,D,box._span);});});
+ var mb=box.querySelectorAll('.mmmode button');
+ mb.forEach(function(b){b.addEventListener('click',function(){mb.forEach(function(x){x.classList.toggle('on',x===b);});
+   box.dataset.mode=b.dataset.k;draw(box,D,box._span||126);});});
+ if(!D.o){var gm=box.querySelector('.mmmode');if(gm)gm.style.display='none';}
  var cb=box.querySelectorAll('.mmcmp button');
  cb.forEach(function(b){b.addEventListener('click',function(){cb.forEach(function(x){x.classList.toggle('on',x===b);});
    box.dataset.cmp=b.dataset.k;draw(box,D,box._span||126);});});
@@ -1680,7 +1923,7 @@ def _mm_divergence(mm, reg, nifty, seg, gap_lim=15, lead_gap=10, off_high=3.0, n
 ON, HIDE = ' class="on"', ' style="display:none"'   # kept outside f-strings: Python < 3.12 forbids backslashes in them
 
 
-def _mm_chart(mm, nifty, days=252, seg=None):
+def _mm_chart(mm, nifty, days=252, seg=None, ohlc=None):
     """Skeleton + JSON for the stacked sentiment charts; MM_JS draws them."""
     view = mm.tail(days)
     reg = mm_regime(mm).reindex(view.index)
@@ -1698,11 +1941,14 @@ def _mm_chart(mm, nifty, days=252, seg=None):
             "sc": arr(reg["score"], 0),
             "sm": arr((seg or {}).get("Smallcap 250", {}).get("lvl", pd.Series(dtype=float)).reindex(view.index), 3),
             "md": arr((seg or {}).get("Midcap 150", {}).get("lvl", pd.Series(dtype=float)).reindex(view.index), 3)}
+    if ohlc is not None:
+        o = ohlc.reindex(view.index)
+        data.update({"o": arr(o["Open"]), "h": arr(o["High"]), "l": arr(o["Low"])})
     payload = html.escape(json.dumps(data, allow_nan=False), quote=True)
     rng = "".join(f'<button data-n="{n}"{ON if n == 126 else ""}>{lab}</button>'
                   for lab, n in (("3M", 63), ("6M", 126), ("1Y", 252)))
     return f"""<div class="card mmc" data-d="{payload}">
-<div class="mtop"><div class="mminfo"></div><div class="tabs"><div class="seg mmcmp"><button data-k="sm" class="on">Smallcap 250</button><button data-k="md">Midcap 150</button><button data-k="">Off</button></div><div class="seg mmrng">{rng}</div></div></div>
+<div class="mtop"><div class="mminfo"></div><div class="tabs"><div class="seg mmmode"><button data-k="line" class="on">Line</button><button data-k="candle">Candles</button></div><div class="seg mmcmp"><button data-k="sm" class="on">Smallcap 250</button><button data-k="md">Midcap 150</button><button data-k="">Off</button></div><div class="seg mmrng">{rng}</div></div></div>
 <svg class="mmsvg" preserveAspectRatio="xMidYMid meet"></svg>
 <div class="note">Nifty 50 against the daily verdict: <span class="pos">green</span> background = buying
 dominates, <span class="neg">red</span> = selling dominates, yellow = mixed, <span class="pos">green stripes</span> =
@@ -1743,13 +1989,13 @@ def _mm_table(mm, index, rows=252, show=21):
 {''.join(body)}</table></div></div>"""
 
 
-def _mm_tab(monitors, nifty, cfg, seg=None):
+def _mm_tab(monitors, nifty, cfg, seg=None, ohlc=None):
     """monitors = [(dropdown label, mm frame, subtitle note)]; the first one shows by default."""
     tp = cfg.get("thrust_pctile", 90)
     n750 = next(((label, mm) for label, mm, _ in monitors if label == "Nifty 750"), None)
     sel, blocks = _switch([(label, f"""<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet
 across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session first</p>
-{_mm_read(mm, tp, n750 if label != "Nifty 750" else None, nifty, seg)}{_mm_chart(mm, nifty, seg=seg)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
+{_mm_read(mm, tp, n750 if label != "Nifty 750" else None, nifty, seg)}{_mm_chart(mm, nifty, seg=seg, ohlc=ohlc)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
                            for label, mm, note in monitors])
     return f"""<div class="uwrap">
 <div class="shead"><h2>Monitor</h2>{sel}</div>
@@ -1938,6 +2184,7 @@ Action lists use the {_esc(universe)} universe.</p>"""
     tabs = [(name, h) for name, h in (("Monitor", extras.get("mm_html")),
                                       ("IPO screener", extras.get("ipo_html")),
                                       ("RVOL screener", extras.get("rvol_html")),
+                                      ("Manas Arora", extras.get("manas_html")),
                                       ("Market breadth", breadth_html)) if h]
     tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
                      f'{_esc(name)}</button>' for i, (name, _) in enumerate(tabs))
@@ -1969,14 +2216,16 @@ AD_UNIVERSES = (("Nifty Total Market", "TOTAL MARKET"), ("Nifty MidSmallcap 400"
 
 
 def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_dashboard.html",
-                  ipo=None, rvol=None, monitor=None):
+                  ipo=None, rvol=None, monitor=None, manas=None):
     """Builds the dashboard, displays it in the notebook and writes the HTML file.
 
     `ipo` / `rvol` are screener settings dicts; None skips that tab.
     """
     symbols, industries = fetch_universe()
     closes, volumes = load_prices(symbols, period=period, refresh=refresh)
-    nifty = load_index("^NSEI", period=period, refresh=refresh)
+    nifty_ohlc = load_index_ohlc("^NSEI", period=period, refresh=refresh)
+    nifty = (nifty_ohlc["Close"].rename("close") if nifty_ohlc is not None
+             else load_index("^NSEI", period=period, refresh=refresh))
     closes, volumes = _match_calendar(closes, volumes, nifty)
 
     panels = segment_panels(closes)
@@ -2009,6 +2258,8 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
         "nifty": nifty,
     }
 
+    mm_c = mm_v = None
+    monitors = []
     if monitor is not None:
         try:
             params = dict(min_volume=monitor.get("min_volume", 100000),
@@ -2037,10 +2288,42 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
                     r = panels[key].pct_change(fill_method=None).clip(-0.5, 0.5).mean(axis=1)
                     seg[name] = {"lvl": (1 + r.fillna(0)).cumprod() * 100,      # equal-weighted
                                  "p50": breadth_of(key)["pct_above_50ema"]}
-            extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor, seg)
+            extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor, seg, nifty_ohlc)
         except Exception as e:
             print(f"  [warn] Market Monitor failed: {e}", file=sys.stderr)
             extras["mm_html"] = f'<div class="card note" style="margin-top:16px">Market Monitor failed: {_esc(e)}</div>'
+
+    if manas is not None:
+        try:
+            ohl = load_ohl(period)
+            if ohl is None:
+                raise RuntimeError("open/high/low cache missing - run once with REFRESH = True")
+            o, h_, l_ = (x.reindex(index=closes.index, columns=closes.columns) for x in ohl)
+            uc, uv = closes, volumes
+            if mm_c is not None:                                  # all NSE stocks, as the Monitor
+                xohl = load_ohl(period, tag="fullmkt")
+                if xohl is not None:
+                    uc, uv = mm_c, mm_v
+                    o, h_, l_ = (pd.concat([a, b.reindex(closes.index)], axis=1)
+                                 .loc[:, lambda f: ~f.columns.duplicated()].reindex(columns=uc.columns)
+                                 for a, b in zip((o, h_, l_), xohl))
+            m_params = {k: v for k, v in manas.items() if k not in CHART_KEYS}
+            tables, frames = run_manas_screener(uc, uv, o, h_, l_, **m_params)
+            note = ""
+            if monitors:
+                reg = mm_regime(monitors[0][1])
+                stt = int(reg["state"].iloc[-1])
+                verdict = {1: "Buying dominates", -1: "Selling dominates", 2: "Turning up?",
+                           -2: "Turning down?"}.get(stt, "Mixed")
+                note = (f"<b>Market ({monitors[0][0]}): {verdict}</b> (score {reg['score'].iloc[-1]:.0f}). "
+                        f"Manas checks the market before any set-up and sizes down or sits out when "
+                        f"it is weak &mdash; breakouts follow through far more often when buying dominates.")
+            print(f"Manas screener: " + ", ".join(f"{k} {len(v)}" for k, v in tables.items()))
+            extras["manas_html"] = _manas_tab(tables, frames, manas, note)
+        except Exception as e:
+            print(f"  [warn] Manas screener failed: {e}", file=sys.stderr)
+            extras["manas_html"] = f'<div class="card note" style="margin-top:16px">Screener failed: {_esc(e)}</div>'
+
 
     for key, cfg, run, tab in (("ipo_html", ipo, lambda c: run_ipo_screener(**c), _ipo_tab),
                                ("rvol_html", rvol, lambda c: run_rvol_screener(symbols, **c), _rvol_tab)):
@@ -2107,6 +2390,27 @@ MARKET_MONITOR = dict(
     lookback=252,               # sessions - NSE's own version of Stockbee's US "300"
 )
 
+# Manas Arora set-ups tab (set to None to skip). Uses the Monitor's All NSE download.
+MANAS_SCREENER = dict(
+    min_price=30.0,             # his trend filter: close above Rs 30 ...
+    near_high_pct=25.0,         # ... within 25% of the 52-week high
+    above_low_pct=50.0,         # ... at least 50% above the 52-week low
+    purple_move=0.05,           # "purple dot" = a 5%+ day ...
+    purple_volume=1_000_000,    # ... on 1M+ shares (within the last 60 sessions)
+    prior_run_pct=50.0,         # SVRO needs a 50%+ prior run
+    tight_range_pct=3.0,        # SVRO: average daily range of the last 3 days
+    max_ema_dist_pct=5.0,       # SVRO: close 0-5% above the 21 EMA
+    pullback_min_pct=4.0,       # 2A: 4-20% off the 15-day high, at the 21 EMA
+    pullback_max_pct=20.0,
+    breakout_vol_x=1.5,         # breakout volume vs the 20-day average
+    pre_breakout_pct=3.0,       # pre-breakout: within 3% of the 20-day high ...
+    base_range_pct=10.0,        # ... with a 10-day range of 10% or less
+    show_charts=True,
+    chart_months=6,
+    chart_emas=(10, 21, 50),    # his working averages
+    max_charts=60,              # triggers first, then set-ups
+)
+
 # RVOL screener tab (set to None to skip). Same defaults as the RVOL notebook.
 RVOL_SCREENER = dict(
     min_rvol_pct=1000.0,        # 1000% = 10x the prior average volume
@@ -2128,4 +2432,4 @@ RVOL_SCREENER = dict(
 
 if __name__ == "__main__":
     run_dashboard(period=PERIOD, universe=UNIVERSE, refresh=REFRESH, output=OUTPUT_HTML,
-                  ipo=IPO_SCREENER, rvol=RVOL_SCREENER, monitor=MARKET_MONITOR)
+                  ipo=IPO_SCREENER, rvol=RVOL_SCREENER, monitor=MARKET_MONITOR, manas=MANAS_SCREENER)
