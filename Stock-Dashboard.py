@@ -1194,7 +1194,7 @@ PART_WINDOWS = (9, 21, 50, 200)
 MM_JS = r"""
 (function(){
 var NS='http://www.w3.org/2000/svg',MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-var W=1200,H=340,L=64,R=14,T=12,B=26,PW=W-L-R,PH=H-T-B;
+var MMID=0,W=1200,H=340,L=64,R=14,T=12,B=26,PW=W-L-R,PH=H-T-B;
 function ok(v){return v!==null&&v!==undefined&&isFinite(v);}
 function mk(p,t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e;}
 function txt(p,x,y,s,a){var e=mk(p,'text',Object.assign({x:x,y:y,'font-size':11,fill:'#6b7280'},a||{}));e.textContent=s;return e;}
@@ -1205,21 +1205,30 @@ function info(box,D,i){var s=D.s[i],tag=s===2?['Turning up?','pos']:s===-2?['Tur
   +(ok(D.sc[i])?' <span class="dim">(score '+fn(D.sc[i])+')</span>':'')
   +' &middot; Nifty '+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
   +' <span class="dim">(thrust '+fn(D.tu[i])+' / '+fn(D.td[i])+')</span> &middot; 5d '+fn(D.r5[i],2)+' &middot; 10d '+fn(D.r10[i],2)
-  +' &middot; T2108 '+fn(D.t[i],1);}
+  +' &middot; T2108 '+fn(D.t[i],1)
+  +(box._cv&&box._b0!==null&&ok(box._cv(i))?'<br><span class="dim">Since '+fd(D.d[box._b0])+': Nifty 50 '
+    +(D.ix[i]/D.ix[box._b0]*100-100).toFixed(1)+'% &middot; <span style="color:#ea580c">'
+    +(box.dataset.cmp==='md'?'Midcap 150':'Smallcap 250')+' (equal-weighted, dashed) '
+    +(box._cv(i)/box._cv(box._b0)*100-100).toFixed(1)+'%</span></span>':'');}
 function draw(box,D,span){
  var svg=box.querySelector('svg');while(svg.firstChild)svg.removeChild(svg.firstChild);
  svg.setAttribute('viewBox','0 0 '+W+' '+H);
- var defs=mk(svg,'defs',{});[['mmTu','#86efac'],['mmTd','#fca5a5']].forEach(function(p){
+ var uid=box.dataset.uid||(box.dataset.uid=String(++MMID));  // unique per chart: a hidden chart's pattern doesn't paint
+ var defs=mk(svg,'defs',{});[['mmTu'+uid,'#86efac'],['mmTd'+uid,'#fca5a5']].forEach(function(p){
    var pt=mk(defs,'pattern',{id:p[0],width:8,height:8,patternUnits:'userSpaceOnUse',patternTransform:'rotate(45)'});
    mk(pt,'rect',{width:8,height:8,fill:'#ffffff'});mk(pt,'rect',{width:4,height:8,fill:p[1]});});
  var N=D.d.length,i0=Math.max(0,N-span),n=N-i0,step=PW/n;
  function X(i){return L+(i-i0+0.5)*step;}
- var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){var v=D.ix[i];if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}}
+ var ck=box.dataset.cmp===undefined?'sm':box.dataset.cmp,C=ck?D[ck]:null,b0=null,base=null;
+ if(C){for(var i=i0;i<N;i++){if(ok(C[i])&&ok(D.ix[i])){b0=i;break;}}if(b0!==null)base=D.ix[b0]/C[b0];}
+ function CV(i){return (base!==null&&ok(C[i]))?C[i]*base:null;}
+ box._cv=CV;box._b0=b0;
+ var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){[D.ix[i],CV(i)].forEach(function(v){if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}});}
  if(!(hi>lo)){lo=0;hi=1;}var pad=(hi-lo)*0.12;lo-=pad;hi+=pad;
  function Y(v){return T+(1-(v-lo)/(hi-lo))*PH;}
  // background = daily verdict
  for(var i=i0;i<N;i++){var s=D.s[i];mk(svg,'rect',{x:X(i)-step/2,y:T,width:step+0.5,height:PH,
-   fill:s===2?'url(#mmTu)':s===-2?'url(#mmTd)':s>0?'#dcfce7':s<0?'#fee2e2':'#fef9c3'});}
+   fill:s===2?'url(#mmTu'+uid+')':s===-2?'url(#mmTd'+uid+')':s>0?'#dcfce7':s<0?'#fee2e2':'#fef9c3'});}
  // grid + y labels
  for(var k=0;k<=4;k++){var v=lo+(hi-lo)*k/4,yy=Y(v);mk(svg,'line',{x1:L,x2:L+PW,y1:yy,y2:yy,stroke:'#ffffff','stroke-width':1});
    txt(svg,L-6,yy+4,fn(v,0),{'text-anchor':'end'});}
@@ -1229,6 +1238,8 @@ function draw(box,D,span){
    txt(svg,X(i)-step/2,H-8,MON[+p[1]-1]+(p[1]==='01'?' '+p[0].slice(2):''),{'text-anchor':'middle'});}last=m;}
  // Nifty line
  var d='';for(var i=i0;i<N;i++){if(ok(D.ix[i]))d+=(d?'L':'M')+X(i).toFixed(1)+','+Y(D.ix[i]).toFixed(1);}
+ if(base!==null){var dc='';for(var i=i0;i<N;i++){var v=CV(i);if(ok(v))dc+=(dc?'L':'M')+X(i).toFixed(1)+','+Y(v).toFixed(1);}
+   mk(svg,'path',{d:dc,fill:'none',stroke:'#ea580c','stroke-width':1.6,'stroke-dasharray':'5,3'});}
  mk(svg,'path',{d:d,fill:'none',stroke:'#111827','stroke-width':1.8});
  // thrust days: triangles above (buying) / below (selling) the line
  var sz=Math.max(4,Math.min(7,step*0.9));
@@ -1248,7 +1259,11 @@ function draw(box,D,span){
 document.querySelectorAll('.mmc').forEach(function(box){
  var D=JSON.parse(box.dataset.d),btns=box.querySelectorAll('.mmrng button');
  btns.forEach(function(b){b.addEventListener('click',function(){btns.forEach(function(x){x.classList.toggle('on',x===b);});
-   draw(box,D,+b.dataset.n);});});
+   box._span=+b.dataset.n;draw(box,D,box._span);});});
+ var cb=box.querySelectorAll('.mmcmp button');
+ cb.forEach(function(b){b.addEventListener('click',function(){cb.forEach(function(x){x.classList.toggle('on',x===b);});
+   box.dataset.cmp=b.dataset.k;draw(box,D,box._span||126);});});
+ if(!(D.sm||[]).some(ok)){box.dataset.cmp='';var g=box.querySelector('.mmcmp');if(g)g.style.display='none';}
  draw(box,D,126);
 });
 document.querySelectorAll('.mmrows').forEach(function(seg){
@@ -1523,7 +1538,7 @@ def mm_green_type(mm, reg, washed=15, late=45):
             f"nor late: hold while green and watch Nifty 750 for the first warning.")
 
 
-def _mm_read(mm, pctile, other=None):
+def _mm_read(mm, pctile, other=None, nifty=None, seg=None):
     """Today's read: sentiment verdict, its score and parts, thrust days and the ratios."""
     last = mm.iloc[-1]
     reg = mm_regime(mm)
@@ -1568,6 +1583,8 @@ def _mm_read(mm, pctile, other=None):
                            f'<b class="{"pos" if now[k] >= 60 else "neg" if now[k] <= 40 else ""}">'
                            f'{num(now[k], 0)}</b></div>')
     sc = now["score"]
+    rc = lambda v, hi, lo: ("" if _missing(v) or _missing(hi) or _missing(lo) else
+                            "pos" if v >= hi else "neg" if v <= lo else "")
     return f"""<div class="grid g4 mmread">
 <div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}
 <span class="cnt">since {since:%d %b}</span></div>
@@ -1578,21 +1595,92 @@ def _mm_read(mm, pctile, other=None):
 <div class="note" style="margin:0 0 4px">60+ buying &middot; 40 or less selling &middot; each part ranked vs its past year</div>
 {part("bal", "4% balance, 10 days")}{part("t2108", "T2108 level")}
 {part("t2108_trend", "T2108 trend")}{part("prim_trend", "Primary trend")}</div>
-<div class="card"><div class="ttl">Thrust days, last 10</div>
-<div class="big"><span class="pos">{b10}</span> <span class="dim" style="font-size:18px">vs</span> <span class="neg">{s10}</span></div>
-<div class="note" style="margin:0">Today's &ldquo;300&rdquo;: <b>{lvl(last['thr_up'])}+</b> up 4% for buying,
-<b>{lvl(last['thr_dn'])}+</b> down 4% for selling (top {100 - pctile:g}% of the last year)</div></div>
-<div class="card"><div class="ttl">5 / 10-day ratio</div>
-<div class="big">{num(r5)} <span class="dim" style="font-size:18px">/ {num(r10)}</span></div>
-<div class="note" style="margin:0">NSE's normal is about <b>{num(last['r5_med'], 1)}</b> / <b>{num(last['r10_med'], 1)}</b>.
-Strong buying &ge; {num(last['r5_hi'], 1)}, strong selling &le; {num(last['r5_lo'], 1)} (5-day, top / bottom 20% of the last year)</div></div>
+{_mm_divergence(mm, reg, nifty, seg)}
+<div class="card"><div class="ttl">Thrusts &amp; ratios</div>
+<div class="row" style="margin-top:8px"><span class="dim">Thrust days, last 10</span>
+<b><span class="pos">{b10}</span> <span class="dim">vs</span> <span class="neg">{s10}</span></b></div>
+<div class="note" style="margin:0 0 8px">Today's &ldquo;300&rdquo;: <b>{lvl(last['thr_up'])}+</b> up 4% (buying),
+<b>{lvl(last['thr_dn'])}+</b> down 4% (selling) &middot; top {100 - pctile:g}% of the last year</div>
+<div class="row"><span class="dim">5-day ratio</span><b class="{rc(r5, last['r5_hi'], last['r5_lo'])}">{num(r5)}</b></div>
+<div class="row"><span class="dim">10-day ratio</span><b class="{rc(r10, last['r10_hi'], last['r10_lo'])}">{num(r10)}</b></div>
+<div class="note" style="margin:4px 0 0">Normal is about <b>{num(last['r5_med'], 1)}</b> / <b>{num(last['r10_med'], 1)}</b>.
+5-day: strong buying &ge; {num(last['r5_hi'], 1)}, strong selling &le; {num(last['r5_lo'], 1)} (top / bottom 20% of the last year)</div></div>
 </div>"""
+
+
+def _mm_divergence(mm, reg, nifty, seg, gap_lim=15, lead_gap=10, off_high=3.0, near_high=1.0):
+    """Card 3: Nifty 50 vs mid / small caps. Flags a divergence, else shows who is leading.
+
+    Participation = % of stocks above their 50-day EMA in each index; the gap is
+    Nifty 50 minus Smallcap 250. Rules, back-checked on Nov 2025 - Nov 2026 NSE data:
+      narrow   - Nifty within 1% of its 20-day high and the gap >= +15: large caps carry the
+                 index. 11 of 11 past cases (all Nov 2025 - Feb 2026) had the Nifty lower
+                 20 sessions later. Shown as a caution: one stretch of market, small sample.
+      lead_dn  - Nifty 3%+ below its 20-day high, gap <= -10, breadth not red, green within
+                 20 sessions, no washout: large caps lead the decline (4 of 7 fell further).
+      lead_up  - Nifty 3%+ below its high, gap <= -10 after a washout (T2108 <= 15 within 15
+                 sessions): small caps lead out of the low (2 of 2 rose 3-6% in 20 sessions).
+    """
+    rows = [(k, v) for k, v in (seg or {}).items() if v is not None]
+    if nifty is None or not rows or "Nifty 50" not in (seg or {}) or "Smallcap 250" not in seg:
+        return '<div class="card"><div class="ttl">Large vs small caps</div><div class="note">Index data unavailable today.</div></div>'
+    ix = nifty.reindex(mm.index).ffill()
+    dd = (ix / ix.rolling(20, min_periods=10).max() - 1) * 100
+    p50 = {k: v["p50"].reindex(mm.index) for k, v in rows}
+    gap = p50["Nifty 50"] - p50["Smallcap 250"]
+    sm_chg = p50["Smallcap 250"] - p50["Smallcap 250"].shift(10)
+    st = reg["state"]
+    washed = mm["t2108"].rolling(15, min_periods=1).min() <= 15
+    green20 = (st == 1).rolling(20, min_periods=1).max() > 0
+    d, g, sc_ = dd.iloc[-1], gap.iloc[-1], sm_chg.iloc[-1]
+    alert = None
+    if not _missing(d) and not _missing(g):
+        if d >= -near_high and g >= gap_lim:
+            trend = (f"Small caps are catching up ({p50['Smallcap 250'].iloc[-11]:.0f}% &rarr; "
+                     f"{p50['Smallcap 250'].iloc[-1]:.0f}% in 10 days)." if sc_ >= 0 else
+                     f"Small caps are falling behind ({p50['Smallcap 250'].iloc[-11]:.0f}% &rarr; "
+                     f"{p50['Smallcap 250'].iloc[-1]:.0f}%).")
+            alert = ("Large caps leading the index", "amb",
+                     f"Nifty near its high with Nifty 50 participation {g:.0f} points above small caps. {trend} "
+                     f"In Nov 2025 &ndash; Feb 2026 this set-up came before a lower Nifty 20 days later "
+                     f"in all 11 cases (one stretch of market &mdash; treat as a caution).")
+        elif d <= -off_high and g <= -lead_gap and washed.iloc[-1]:
+            alert = ("Small caps leading out of the low", "ok",
+                     f"Nifty {d:.1f}% off its 20-day high but small caps are {-g:.0f} points ahead in "
+                     f"participation after a washed-out market. Both times in 2026 (25 Mar, 1 Apr) the Nifty "
+                     f"was 3&ndash;6% higher 20 days later.")
+        elif d <= -off_high and g <= -lead_gap and st.iloc[-1] in (0, 1, 2) and green20.iloc[-1]:
+            alert = ("Large caps leading the decline", "bad",
+                     f"Nifty {d:.1f}% off its 20-day high while breadth still holds (small caps {-g:.0f} points "
+                     f"ahead). In 2026 this came before further falls 4 times out of 7 (e.g. 8 Sep). Watch "
+                     f"Nifty 750 and tighten exits.")
+    style = {"ok": "background:#dcfce7;color:#15803d", "bad": "background:#fee2e2;color:#b91c1c",
+             "amb": "background:#fef3c7;color:#b45309"}
+    head = (f'<div style="margin:10px 0 4px"><span class="tag" style="{style[alert[1]]}">{alert[0]}</span></div>'
+            f'<div class="note" style="margin:0 0 8px">{alert[2]}</div>') if alert else \
+           ('<div style="margin:10px 0 4px"><span class="tag" style="background:#f3f4f6;color:#374151">'
+            'No divergence</span></div>')
+    def ret20(lvl):
+        x = lvl.reindex(mm.index).ffill()
+        return (x.iloc[-1] / x.iloc[-21] - 1) * 100 if len(x) > 21 and x.iloc[-21] > 0 else np.nan
+    perf = {k: ret20(v["lvl"]) for k, v in rows}
+    body = "".join(
+        f'<div class="row"><span class="dim">{k}</span><span><b>{p50[k].iloc[-1]:.0f}%</b> '
+        f'<span class="cnt">({"+" if p50[k].iloc[-1] - p50[k].iloc[-11] >= 0 else "&minus;"}'
+        f'{abs(p50[k].iloc[-1] - p50[k].iloc[-11]):.0f})</span> &middot; '
+        f'<b class="{"pos" if perf[k] >= 0 else "neg"}">{perf[k]:+.1f}%</b></span></div>'
+        for k, _ in rows if not _missing(p50[k].iloc[-1]) and not _missing(perf[k]))
+    lead = max(((k, perf[k]) for k, _ in rows if not _missing(perf[k])), key=lambda t: t[1], default=None)
+    lead_txt = f"Leading over 20 days: <b>{lead[0]}</b>." if lead else ""
+    return f"""<div class="card"><div class="ttl">Large vs small caps</div>{head}
+<div class="note" style="margin:0 0 2px">% above 50-day average (10-day change) &middot; 20-day return, equal-weighted</div>
+{body}<div class="note" style="margin:6px 0 0">{lead_txt}</div></div>"""
 
 
 ON, HIDE = ' class="on"', ' style="display:none"'   # kept outside f-strings: Python < 3.12 forbids backslashes in them
 
 
-def _mm_chart(mm, nifty, days=252):
+def _mm_chart(mm, nifty, days=252, seg=None):
     """Skeleton + JSON for the stacked sentiment charts; MM_JS draws them."""
     view = mm.tail(days)
     reg = mm_regime(mm).reindex(view.index)
@@ -1607,17 +1695,21 @@ def _mm_chart(mm, nifty, days=252):
             "r5": arr(view["r5"]), "r10": arr(view["r10"]),
             "qu": arr(view["q25_up"], 0), "qd": arr(view["q25_dn"], 0),
             "t": arr(view["t2108"], 1), "s": [int(v) for v in reg["state"]],
-            "sc": arr(reg["score"], 0)}
+            "sc": arr(reg["score"], 0),
+            "sm": arr((seg or {}).get("Smallcap 250", {}).get("lvl", pd.Series(dtype=float)).reindex(view.index), 3),
+            "md": arr((seg or {}).get("Midcap 150", {}).get("lvl", pd.Series(dtype=float)).reindex(view.index), 3)}
     payload = html.escape(json.dumps(data, allow_nan=False), quote=True)
     rng = "".join(f'<button data-n="{n}"{ON if n == 126 else ""}>{lab}</button>'
                   for lab, n in (("3M", 63), ("6M", 126), ("1Y", 252)))
     return f"""<div class="card mmc" data-d="{payload}">
-<div class="mtop"><div class="mminfo"></div><div class="seg mmrng">{rng}</div></div>
+<div class="mtop"><div class="mminfo"></div><div class="tabs"><div class="seg mmcmp"><button data-k="sm" class="on">Smallcap 250</button><button data-k="md">Midcap 150</button><button data-k="">Off</button></div><div class="seg mmrng">{rng}</div></div></div>
 <svg class="mmsvg" preserveAspectRatio="xMidYMid meet"></svg>
 <div class="note">Nifty 50 against the daily verdict: <span class="pos">green</span> background = buying
 dominates, <span class="neg">red</span> = selling dominates, yellow = mixed, <span class="pos">green stripes</span> =
 turning up? (buying thrust from oversold, not yet confirmed), <span class="neg">red stripes</span> = turning down?. &#9650; = buying-thrust day,
-&#9660; = selling-thrust day. A change of background colour is a change in sentiment. Hover any day to
+&#9660; = selling-thrust day. <span style="color:#ea580c">Dashed orange</span> = Smallcap 250 or
+Midcap 150 (equal-weighted from their member stocks, rebased to the Nifty at the start of the view) &mdash;
+when the two lines split, large and small caps are diverging. A change of background colour is a change in sentiment. Hover any day to
 read its numbers.</div></div>"""
 
 
@@ -1651,13 +1743,13 @@ def _mm_table(mm, index, rows=252, show=21):
 {''.join(body)}</table></div></div>"""
 
 
-def _mm_tab(monitors, nifty, cfg):
+def _mm_tab(monitors, nifty, cfg, seg=None):
     """monitors = [(dropdown label, mm frame, subtitle note)]; the first one shows by default."""
     tp = cfg.get("thrust_pctile", 90)
     n750 = next(((label, mm) for label, mm, _ in monitors if label == "Nifty 750"), None)
     sel, blocks = _switch([(label, f"""<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet
 across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session first</p>
-{_mm_read(mm, tp, n750 if label != "Nifty 750" else None)}{_mm_chart(mm, nifty)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
+{_mm_read(mm, tp, n750 if label != "Nifty 750" else None, nifty, seg)}{_mm_chart(mm, nifty, seg=seg)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
                            for label, mm, note in monitors])
     return f"""<div class="uwrap">
 <div class="shead"><h2>Monitor</h2>{sel}</div>
@@ -1814,22 +1906,7 @@ def build_dashboard(b, sec_df, universe, extras):
     today = b.index[-1]
     isel, iblocks = _switch([(label, _market_internals(bb, extras.get("nifty")))
                              for label, bb in extras["internals"].items()])
-    tabs = [("Market breadth", None)] + [(name, h) for name, h in
-                                         (("Monitor", extras.get("mm_html")),
-                                          ("IPO screener", extras.get("ipo_html")),
-                                          ("RVOL screener", extras.get("rvol_html"))) if h]
-    tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
-                     f'{_esc(name)}</button>' for i, (name, _) in enumerate(tabs))
-    other_panes = "".join(f'<div class="tabpane" data-t="{i}" style="display:none">{h}</div>'
-                          for i, (_, h) in enumerate(tabs) if i)
-
-    return f"""<!doctype html><meta charset="utf-8">
-<title>NSE Market Breadth - {today:%d %b %Y}</title><style>{CSS}</style>
-<div class="wrap tabwrap">
-<p class="sub">NSE market breadth &middot; {today:%A, %d %B %Y}</p>
-<div class="tabbar">{tabbar}</div>
-<div class="tabpane" data-t="0">
-
+    breadth_html = f"""
 <h2>Today's breadth</h2>
 <p class="secsub">How many stocks took part, in which size bracket, and who was buying</p>
 {_breadth_today(extras)}
@@ -1855,9 +1932,25 @@ def build_dashboard(b, sec_df, universe, extras):
 {_sector_table(sec_df)}
 
 <p class="note">Data from {b.index[0]:%b %Y} to {today:%d %b %Y} ({len(b):,} sessions).
-Action lists use the {_esc(universe)} universe.</p>
-</div>
-{other_panes}
+Action lists use the {_esc(universe)} universe.</p>"""
+
+    # tab order: Monitor first, the screeners, Market breadth last
+    tabs = [(name, h) for name, h in (("Monitor", extras.get("mm_html")),
+                                      ("IPO screener", extras.get("ipo_html")),
+                                      ("RVOL screener", extras.get("rvol_html")),
+                                      ("Market breadth", breadth_html)) if h]
+    tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
+                     f'{_esc(name)}</button>' for i, (name, _) in enumerate(tabs))
+    panes = "".join(f'<div class="tabpane" data-t="{i}"{"" if i == 0 else HIDE}>{h}</div>'
+                    for i, (_, h) in enumerate(tabs))
+
+    return f"""<!doctype html><meta charset="utf-8">
+<title>NSE Market Breadth - {today:%d %b %Y}</title><style>{CSS}</style>
+<div class="wrap tabwrap">
+<p class="sub">NSE market breadth &middot; data to {today:%A, %d %B %Y} &middot;
+last updated {datetime.now(IST):%d %b %Y, %I:%M %p} IST</p>
+<div class="tabbar">{tabbar}</div>
+{panes}
 </div>
 <script>{MB_JS}{MM_JS}</script>"""
 
@@ -1937,7 +2030,14 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
                 mm_v = mm_v.loc[:, ~mm_v.columns.duplicated()]
                 monitors.insert(0, ("All NSE stocks", market_monitor(mm_c, mm_v, **params),
                                     " listed on NSE (main board; Z category and SME excluded)"))
-            extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor)
+            seg = {}
+            for name, key in (("Nifty 50", "Nifty 50"), ("Midcap 150", "Midcap 150"),
+                              ("Smallcap 250", "Smallcap 250")):
+                if key in panels:
+                    r = panels[key].pct_change(fill_method=None).clip(-0.5, 0.5).mean(axis=1)
+                    seg[name] = {"lvl": (1 + r.fillna(0)).cumprod() * 100,      # equal-weighted
+                                 "p50": breadth_of(key)["pct_above_50ema"]}
+            extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor, seg)
         except Exception as e:
             print(f"  [warn] Market Monitor failed: {e}", file=sys.stderr)
             extras["mm_html"] = f'<div class="card note" style="margin-top:16px">Market Monitor failed: {_esc(e)}</div>'
