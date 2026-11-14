@@ -1119,7 +1119,8 @@ RVOL_COLUMNS = [("ticker", "Ticker"), ("rvol_date", "Spike Date"), ("rvol_pct", 
 def run_manas_screener(closes, volumes, opens, highs, lows, min_price=30.0, near_high_pct=25.0,
                        above_low_pct=50.0, purple_move=0.05, purple_volume=1_000_000, prior_run_pct=50.0,
                        tight_range_pct=3.0, max_ema_dist_pct=5.0, pullback_min_pct=4.0, pullback_max_pct=20.0,
-                       breakout_vol_x=1.5, pre_breakout_pct=3.0, base_range_pct=10.0, **_):
+                       breakout_vol_x=1.5, pre_breakout_pct=3.0, base_range_pct=10.0,
+                       min_turnover_cr=2.0, max_breakout_risk_pct=6.0, **_):
     """(tables {name: DataFrame}, frames {ticker: OHLCV}) for the latest session.
 
     Built from secondhand write-ups of Manas Arora's process (his own posts on X could not be read);
@@ -1136,7 +1137,10 @@ def run_manas_screener(closes, volumes, opens, highs, lows, min_price=30.0, near
     sma200 = C.rolling(200, min_periods=190).mean()
     ema21 = C.ewm(span=21, adjust=False).mean()
     hi52, lo52 = H.rolling(252, min_periods=200).max(), L.rolling(252, min_periods=200).min()
-    template = ((C > min_price) & (C >= hi52 * (1 - near_high_pct / 100)) & (C > sma50) & (sma50 > sma200)
+    turnover_cr = (C * V).shift(1).rolling(20).mean() / 1e7                 # 20-day avg traded value, Rs crore
+    traded = ((V > 0) & V.shift(1).rolling(20).mean().gt(0) & (H > L)       # skip no-trade days ...
+              & (turnover_cr >= min_turnover_cr))                           # ... and thin stocks
+    template = traded & ((C > min_price) & (C >= hi52 * (1 - near_high_pct / 100)) & (C > sma50) & (sma50 > sma200)
                 & (sma200 > sma200.shift(63)) & (sma200 > sma200.shift(21))
                 & (C >= lo52 * (1 + above_low_pct / 100)) & (H.rolling(126).max() >= hi52 * 0.999))
     avg_v = V.shift(1).rolling(20).mean()
@@ -1161,11 +1165,13 @@ def run_manas_screener(closes, volumes, opens, highs, lows, min_price=30.0, near
     depth = (1 - C / H.rolling(15).max()) * 100
     zone = (L <= ema21 * 1.02) & (C >= ema21 * 0.98) & (C > sma50)
     pull = template & zone & (depth >= pullback_min_pct) & (depth <= pullback_max_pct)
-    pull_dry = pull & (V.rolling(3).mean() < 0.8 * avg_v)
+    pull_dry = (pull & (ema_dist >= -2) & (ema_dist <= 3) & (rng < avg_rng) & (V < 0.8 * avg_v)
+                & (V.rolling(3).mean() < 0.8 * avg_v))                      # quiet, right at the 21 EMA
     ss = shifted(pull) & strong & template
     sv = pull & (V >= 1.5 * avg_v) & (rng <= 0.75 * avg_rng) & (pos >= 0.5)
-    cv = (template & (L <= ema21) & (C > sma50) & (depth >= pullback_min_pct) & (V >= 2.5 * avg_v)
-          & (rng >= 1.5 * avg_rng) & (pos >= 0.6))
+    # climax volume = a heavy SELLING day that reverses: flat/down day, new pullback low, closes off the lows
+    cv = (template & (L <= ema21) & (L < L.shift(1)) & (ret <= 0.02) & (C > sma50) & (depth >= pullback_min_pct)
+          & (V >= 2.5 * avg_v) & (rng >= 1.5 * avg_rng) & (pos >= 0.6))
     # 3. consolidation breakout / 4. pre-breakout
     hi20 = H.shift(1).rolling(20).max()
     bo = template & (C > hi20) & (V >= breakout_vol_x * avg_v) & (pos >= 0.67)
@@ -1207,25 +1213,30 @@ def run_manas_screener(closes, volumes, opens, highs, lows, min_price=30.0, near
         "svro_watch": table(svro & ~svro_go, "Coiling", "watch"),
         "pb_go": table(ss | sv | cv, tag2a, "go"),
         "pb_watch": table(pull_dry & ~(ss | sv | cv), "Pulling back, volume drying", "watch"),
-        "bo_go": table(bo, "Breakout", "go"),
+        "bo_go": table(bo & ((C - L) / C * 100 <= max_breakout_risk_pct), "Breakout", "go"),
+        "bo_ext": table(bo & ((C - L) / C * 100 > max_breakout_risk_pct), "Extended breakout", "go"),
         "pre_watch": table(pre & ~bo, "Tight base", "watch", level=hi20),
     }
     # funnel for the run log: how many stocks survive each filter on the latest session
     cnt = lambda mask: int(mask.loc[d].fillna(False).astype(bool).sum())
     tmpl = template.loc[d].fillna(False).astype(bool)
-    print("Manas screener funnel (latest session):")
+    print("Minervini screener funnel (latest session):")
     for label, n in (("stocks with a close", int(C.loc[d].notna().sum())),
+                     ("liquid (20-day turnover >= Rs %g cr)" % min_turnover_cr,
+                      int((turnover_cr.loc[d] >= min_turnover_cr).sum())),
                      ("pass trend filter", int(tmpl.sum())),
-                     ("  + purple dot in 60 days", cnt(template & purple60)),
+                     ("  + fast-mover day in 60 days", cnt(template & purple60)),
                      ("  + prior run >= %g%%" % prior_run_pct, cnt(template & purple60 & (run >= prior_run_pct))),
                      ("  + tight 3 days", cnt(template & purple60 & (run >= prior_run_pct)
                                               & (rng.rolling(3).mean() <= tight_range_pct))),
-                     ("  SVRO setting up / triggered", f"{cnt(svro & ~svro_go)} / {cnt(svro_go)}"),
+                     ("  contraction (VCP) setting up / triggered", f"{cnt(svro & ~svro_go)} / {cnt(svro_go)}"),
                      ("  at 21 EMA, 4-20% pullback", cnt(pull)),
-                     ("  2A setting up (volume drying)", cnt(pull_dry & ~(ss | sv | cv))),
-                     ("  2A triggered: strong start / stop vol / climax vol",
+                     ("  pullback setting up (quiet, at the EMA)", cnt(pull_dry & ~(ss | sv | cv))),
+                     ("  pullback triggered: strong start / stop vol / climax vol",
                       f"{cnt(ss)} / {cnt(sv)} / {cnt(cv)}"),
-                     ("  breakouts today", cnt(bo)),
+                     ("  breakouts today: low-risk / extended",
+                      f"{cnt(bo & ((C - L) / C * 100 <= max_breakout_risk_pct))} / "
+                      f"{cnt(bo & ((C - L) / C * 100 > max_breakout_risk_pct))}"),
                      ("  pre-breakout (tight base)", cnt(pre & ~bo))):
         print(f"  {label:<52} {n}")
     names = {t + ".NS" for df in tables.values() if not df.empty for t in df["ticker"]}
@@ -1258,33 +1269,40 @@ def _manas_fmt(key, v):
 
 
 def _manas_tab(tables, frames, cfg, market_note=""):
-    intro = ('<h2>Manas Arora set-ups</h2><p class="secsub">Minervini-style swing set-ups as Manas Arora '
-             'describes them, screened on daily bars across all NSE stocks that pass his trend filter (close '
-             f'above &#8377;{cfg.get("min_price", 30):.0f}, within {cfg.get("near_high_pct", 25):.0f}% of the '
-             '52-week high, close &gt; 50 SMA &gt; 200 SMA, 200 SMA rising 3 months, 50%+ above the 52-week '
-             'low, 52-week high in the last 6 months). Rules come from secondhand write-ups of his posts and '
-             'interviews; his intraday checks (opening range, first-minutes volume) are approximated: '
-             '<i>strong start</i> = opened above yesterday&rsquo;s high and closed green on more volume.</p>'
+    intro = ('<h2>Minervini set-ups</h2><p class="secsub">Minervini-style swing set-ups &mdash; tight '
+             'contractions, pullbacks to the 21 EMA and breakouts &mdash; screened on daily bars across all NSE '
+             'stocks that pass the trend filter: close above '
+             f'&#8377;{cfg.get("min_price", 30):.0f}, 20-day average turnover of at least &#8377;'
+             f'{cfg.get("min_turnover_cr", 2):g} crore, within {cfg.get("near_high_pct", 25):.0f}% of the '
+             '52-week high, close &gt; 50 SMA &gt; 200 SMA, 200 SMA rising for 3 months, 50%+ above the 52-week '
+             'low, and a 52-week high in the last 6 months. Intraday checks (opening range, first-minutes '
+             'volume) are approximated from daily bars: <i>strong start</i> = opened above yesterday&rsquo;s '
+             'high and closed green on more volume.</p>'
              + (f'<div class="card note" style="margin-bottom:6px">{market_note}</div>' if market_note else ""))
     groups = [
-        ("Contraction breakout (SVRO) &middot; triggered today", "svro_go",
-         "Prior 50%+ run with a purple-dot day (5%+ on 1M+ shares), tight inside days 0-5% above the 21 EMA, "
-         "then a strong start."),
-        ("Contraction (SVRO) &middot; setting up", "svro_watch",
+        ("Contraction breakout (VCP) &middot; triggered today", "svro_go",
+         "A 50%+ run with at least one fast-mover day (5%+ on 1M+ shares), then tight inside days 0-5% above "
+         "the 21 EMA, then a strong start."),
+        ("Contraction (VCP) &middot; setting up", "svro_watch",
          "Coiling now. Trigger = a strong start above today's high; stop = today's low."),
-        ("21 EMA pullback (2A) &middot; triggered today", "pb_go",
+        ("21 EMA pullback &middot; triggered today", "pb_go",
          "Strong start = bounce off the EMA; Stop volume = heavy volume on a narrow bar at the EMA (enter next "
          "open); Climax volume = wide, heavy washout through the EMA that closed off the lows."),
-        ("21 EMA pullback (2A) &middot; setting up", "pb_watch",
-         "4-20% off the 15-day high, at the 21 EMA, volume drying up."),
-        ("Consolidation breakout &middot; triggered today", "bo_go",
+        ("21 EMA pullback &middot; setting up", "pb_watch",
+         "4-20% off the 15-day high, closing -2% to +3% from the 21 EMA on a quiet day (range below its 20-day "
+         "average, volume below 80% of average). Trigger = a strong start above today's high."),
+        ("Consolidation breakout &middot; low-risk &middot; triggered today", "bo_go",
          f"Closed above the 20-day high on {cfg.get('breakout_vol_x', 1.5):g}x+ average volume, in the top third "
-         "of the day's range."),
+         f"of the day's range, with the day's low within {cfg.get('max_breakout_risk_pct', 6):g}% (a tight stop)."),
+        ("Consolidation breakout &middot; extended &middot; wait", "bo_ext",
+         f"Same breakout, but the day's low is more than {cfg.get('max_breakout_risk_pct', 6):g}% away. "
+         "Don't chase bars like this; wait for an inside day or a pullback toward the 10/21 EMA for a "
+         "tighter entry."),
         ("Pre-breakout (tight base) &middot; setting up", "pre_watch",
          f"Within {cfg.get('pre_breakout_pct', 3):g}% of the 20-day high, 10-day range "
          f"{cfg.get('base_range_pct', 10):g}% or less, above the 20 MA. Trigger = the 20-day high."),
     ]
-    order = ["svro_go", "pb_go", "bo_go", "svro_watch", "pb_watch", "pre_watch"]   # charts: triggers first
+    order = ["svro_go", "pb_go", "bo_go", "svro_watch", "pb_watch", "pre_watch", "bo_ext"]   # charts: triggers first
     seen, chart_rows = set(), []
     for key in order:
         df = tables.get(key, pd.DataFrame())
@@ -1431,12 +1449,12 @@ function mk(p,t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttr
 function txt(p,x,y,s,a){var e=mk(p,'text',Object.assign({x:x,y:y,'font-size':11,fill:'#6b7280'},a||{}));e.textContent=s;return e;}
 function fd(s){var p=s.split('-');return (+p[2])+' '+MON[+p[1]-1]+' '+p[0];}
 function fn(v,dp){return ok(v)?v.toLocaleString('en-IN',{minimumFractionDigits:dp||0,maximumFractionDigits:dp||0}):'\u2013';}
-function info(box,D,i){var s=D.s[i],tag=s===2?['Turning up?','pos']:s===-2?['Turning down?','neg']:s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
+function info(box,D,i){var s=D.s[i],tag=s===2?['Turning up?','pos']:s===-2?['Turning down?','neg']:s>0?['Buyers in control','pos']:s<0?['Sellers in control','neg']:['Mixed','amb'];
  box.querySelector('.mminfo').innerHTML='<b>'+fd(D.d[i])+'</b> &middot; <b class="'+tag[1]+'">'+tag[0]+'</b>'
-  +(ok(D.sc[i])?' <span class="dim">(score '+fn(D.sc[i])+')</span>':'')
-  +' &middot; Nifty '+(box.dataset.mode==='candle'&&D.o&&ok(D.o[i])?'O '+fn(D.o[i],0)+' H '+fn(D.h[i],0)+' L '+fn(D.l[i],0)+' C ':'')+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
-  +' <span class="dim">(thrust '+fn(D.tu[i])+' / '+fn(D.td[i])+')</span> &middot; 5d '+fn(D.r5[i],2)+' &middot; 10d '+fn(D.r10[i],2)
-  +' &middot; T2108 '+fn(D.t[i],1)
+  +(ok(D.sc[i])?' <span class="dim">(strength '+fn(D.sc[i])+'/100)</span>':'')
+  +' &middot; Nifty '+(box.dataset.mode==='candle'&&D.o&&ok(D.o[i])?'O '+fn(D.o[i],0)+' H '+fn(D.h[i],0)+' L '+fn(D.l[i],0)+' C ':'')+fn(D.ix[i],0)+' &middot; stocks up 4%+ <b class="pos">'+fn(D.up[i])+'</b> / down 4%+ <b class="neg">'+fn(D.dn[i])+'</b>'
+  +' &middot; up vs down (5 days) '+fn(D.r5[i],1)+'&times;'
+  +' &middot; in an uptrend '+fn(D.t[i],0)+'%'
   +(box._cv&&box._b0!==null&&ok(box._cv(i))?'<br><span class="dim">Since '+fd(D.d[box._b0])+': Nifty 50 '
     +(D.ix[i]/D.ix[box._b0]*100-100).toFixed(1)+'% &middot; <span style="color:#ea580c">'
     +(box.dataset.cmp==='md'?'Midcap 150':'Smallcap 250')+' (equal-weighted, dashed) '
@@ -1759,26 +1777,26 @@ def mm_green_type(mm, reg, washed=15, late=45):
     thr_since = int(reg["bthr"].iloc[max(0, i0 - 9):].sum())
     thr_before = int(reg["bthr"].iloc[max(0, i0 - 9):i0 + 1].sum())
     if t_low <= washed and thr_since >= 2:
-        return ("Fresh green &middot; multi-week potential", "ok",
-                f"Began {start:%d %b} from a washed-out market (T2108 low {t_low:.0f}) with {thr_since} buying "
-                f"thrusts. Starts like this led the Apr and Nov 2026 rallies. Hold while green; the first "
-                f"warning is Nifty 750 turning red.")
+        return ("Fresh rally &middot; can run for weeks", "ok",
+                f"Started {start:%d %b} right after a heavy sell-off (only {t_low:.0f}% of stocks were above their "
+                f"40-day average) with {thr_since} strong buying days. Rallies that started like this in Apr and "
+                f"Nov 2026 lasted weeks. Hold while it stays green.")
     if t_low <= washed:
-        return ("Fresh but unconfirmed", "amb",
-                f"From a washed-out market (T2108 low {t_low:.0f}) but only {thr_since} buying thrust so far. "
-                f"A second thrust confirms it; in Mar 2026 two such starts failed before the real low.")
+        return ("Early rally &middot; not confirmed yet", "amb",
+                f"Came straight after a heavy sell-off, but only {thr_since} strong buying day so far. One more "
+                f"would confirm it. In Mar 2026 two starts like this failed before the real bottom.")
     if st.iloc[-1] == 2:
-        return ("Bounce attempt &middot; short trades", "bad",
-                f"A buying thrust, but T2108 only fell to {t_low:.0f} (not washed out). Turns like this on "
-                f"10 Mar, 18 Sep and 6 Oct 2026 mostly failed &mdash; quick trades only until it confirms.")
+        return ("Bounce &middot; quick trades only", "bad",
+                f"Buyers stepped in, but the market wasn't sold out enough (lowest reading {t_low:.0f}% of stocks "
+                f"above their 40-day average). Bounces like this in Mar, Sep and Oct 2026 mostly failed.")
     if t_start >= late and thr_before <= 1:
-        return ("Late green &middot; short trades", "bad",
-                f"Began {start:%d %b} with T2108 already at {t_start:.0f} and {thr_before} buying thrust"
-                f"{'' if thr_before == 1 else 's'} before it. Greens like this faded within two weeks in May, "
-                f"Jul and Aug 2026 &mdash; take quick profits, keep stops tight.")
-    return ("Steady green", "",
-            f"Began {start:%d %b} (T2108 {t_start:.0f}, {thr_since} buying thrusts since). Neither washed-out "
-            f"nor late: hold while green and watch Nifty 750 for the first warning.")
+        return ("Late rally &middot; quick trades only", "bad",
+                f"Started {start:%d %b} when {t_start:.0f}% of stocks were already above their 40-day average, "
+                f"with few strong buying days. Rallies like this faded within two weeks in May, Jul and Aug 2026 "
+                f"&mdash; take profits quickly and keep stops tight.")
+    return ("Steady rally", "",
+            f"Started {start:%d %b}. Not a fresh start after a sell-off, and not late either. Hold while green; "
+            f"Nifty 750 turning red is usually the first warning.")
 
 
 def _mm_read(mm, pctile, other=None, nifty=None, seg=None):
@@ -1791,18 +1809,17 @@ def _mm_read(mm, pctile, other=None, nifty=None, seg=None):
     state = int(now["state"])   # 2 / -2 = turning up / down (early, unconfirmed)
     since = reg.index[-_mm_streak(reg["state"] == state)]   # when sentiment last changed
     if state == 2:
-        verdict, cls, msg = "Turning up?", "ok", ("A buying thrust from oversold &mdash; an early sign funds are "
-                                               "stepping in. Not confirmed yet: wait for a second thrust or a "
-                                               "rising score, and expect false starts.")
+        verdict, cls, msg = "Turning up?", "ok", ("Heavy buying showed up after a sell-off &mdash; an early sign "
+                                               "of a turn. Not confirmed yet, and false starts happen.")
     elif state == -2:
-        verdict, cls, msg = "Turning down?", "bad", ("A selling thrust from an overbought market &mdash; an early "
-                                                   "warning. Not confirmed yet: tighten stops, go easy on new buys.")
+        verdict, cls, msg = "Turning down?", "bad", ("Heavy selling showed up after a strong run &mdash; an early "
+                                                   "warning. Tighten stops and go easy on new buys.")
     elif state > 0:
-        verdict, cls, msg = "Buying dominates", "ok", "Funds are buying. Breakouts tend to work and follow through."
+        verdict, cls, msg = "Buyers in control", "ok", "More stocks are being bought than sold. Breakouts usually work and keep going."
     elif state < 0:
-        verdict, cls, msg = "Selling dominates", "bad", "Funds are selling. Breakouts tend to fail; protect capital."
+        verdict, cls, msg = "Sellers in control", "bad", "More stocks are being sold than bought. Most breakouts fail &mdash; protect your capital."
     else:
-        verdict, cls, msg = "Mixed", "amb", "Neither side in control. Breakouts are less reliable; be selective."
+        verdict, cls, msg = "Mixed", "amb", "Neither side is in control. Breakouts are hit-and-miss &mdash; be picky."
     tag = f'<span class="tag {cls}">{verdict}</span>' if cls != "amb" else \
           f'<span class="tag" style="background:#fef3c7;color:#b45309">{verdict}</span>'
     extra = ""
@@ -1817,9 +1834,10 @@ def _mm_read(mm, pctile, other=None, nifty=None, seg=None):
         o_name, o_mm = other
         o_state = int(mm_regime(o_mm)["state"].iloc[-1])
         if o_state < 0:
-            extra += (f'<div class="note" style="margin:8px 0 0;color:#b91c1c"><b>Warning:</b> {o_name} is '
-                      f'already {"turning down" if o_state == -2 else "red"} &mdash; larger stocks are weakening '
-                      f'first (in Aug 2026 it turned red 4 weeks before this list). Tighten exits.</div>')
+            extra += (f'<div class="note" style="margin:8px 0 0;color:#b91c1c"><b>Warning:</b> {o_name} has '
+                      f'already {"started turning down" if o_state == -2 else "turned red"} &mdash; bigger companies '
+                      f'are weakening first. In Aug 2026 that happened 4 weeks before this list turned. Tighten '
+                      f'your exits.</div>')
     lvl = lambda v: "&ndash;" if _missing(v) else f"{int(v):,}"
     num = lambda v, dp=2: "&ndash;" if _missing(v) else f"{v:.{dp}f}"
     part = lambda k, lab: (f'<div class="row"><span class="dim">{lab}</span>'
@@ -1828,26 +1846,28 @@ def _mm_read(mm, pctile, other=None, nifty=None, seg=None):
     sc = now["score"]
     rc = lambda v, hi, lo: ("" if _missing(v) or _missing(hi) or _missing(lo) else
                             "pos" if v >= hi else "neg" if v <= lo else "")
+    days = _mm_streak(reg["state"] == state)
+    info = lambda t: f' <span class="dim" title="{t}" style="cursor:help">&#9432;</span>'
     return f"""<div class="grid g4 mmread">
-<div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}
-<span class="cnt">since {since:%d %b}</span></div>
+<div class="card"><div class="ttl">Market mood{info("Built from how many stocks make big moves up vs down, how many are in an uptrend, and whether that is improving. Updated after every close.")}</div>
+<div style="margin:10px 0 6px">{tag} <span class="cnt">since {since:%d %b} ({days} day{"s" if days != 1 else ""})</span></div>
 <div class="note" style="margin:0">{msg}</div>{extra}</div>
-<div class="card"><div class="ttl">Sentiment score</div>
+<div class="card"><div class="ttl">Market strength{info("Each line compares today with the past year: 100 = the strongest reading of the year, 0 = the weakest. The big number is their average.")}</div>
 <div class="big {"pos" if state == 1 else "neg" if state == -1 else "amb"}">{num(sc, 0)}
 <span class="dim" style="font-size:14px;font-weight:400">/ 100</span></div>
-<div class="note" style="margin:0 0 4px">60+ buying &middot; 40 or less selling &middot; each part ranked vs its past year</div>
-{part("bal", "4% balance, 10 days")}{part("t2108", "T2108 level")}
-{part("t2108_trend", "T2108 trend")}{part("prim_trend", "Primary trend")}</div>
+<div class="note" style="margin:0 0 4px">60 or more = buyers in control &middot; 40 or less = sellers in control</div>
+{part("bal", "Big up-moves vs big down-moves")}{part("t2108", "Stocks in an uptrend")}
+{part("t2108_trend", "&hellip; and is that rising?")}{part("prim_trend", "Bigger trend improving?")}</div>
 {_mm_divergence(mm, reg, nifty, seg)}
-<div class="card"><div class="ttl">Thrusts &amp; ratios</div>
-<div class="row" style="margin-top:8px"><span class="dim">Thrust days, last 10</span>
-<b><span class="pos">{b10}</span> <span class="dim">vs</span> <span class="neg">{s10}</span></b></div>
-<div class="note" style="margin:0 0 8px">Today's &ldquo;300&rdquo;: <b>{lvl(last['thr_up'])}+</b> up 4% (buying),
-<b>{lvl(last['thr_dn'])}+</b> down 4% (selling) &middot; top {100 - pctile:g}% of the last year</div>
-<div class="row"><span class="dim">5-day ratio</span><b class="{rc(r5, last['r5_hi'], last['r5_lo'])}">{num(r5)}</b></div>
-<div class="row"><span class="dim">10-day ratio</span><b class="{rc(r10, last['r10_hi'], last['r10_lo'])}">{num(r10)}</b></div>
-<div class="note" style="margin:4px 0 0">Normal is about <b>{num(last['r5_med'], 1)}</b> / <b>{num(last['r10_med'], 1)}</b>.
-5-day: strong buying &ge; {num(last['r5_hi'], 1)}, strong selling &le; {num(last['r5_lo'], 1)} (top / bottom 20% of the last year)</div></div>
+<div class="card"><div class="ttl">Strong buying &amp; selling days{info("A strong day is one of the 10% busiest days of the past year for stocks jumping or falling 4% or more on rising volume.")}</div>
+<div class="row" style="margin-top:8px"><span class="dim">Strong buying days (last 10)</span><b class="pos">{b10}</b></div>
+<div class="row"><span class="dim">Strong selling days (last 10)</span><b class="neg">{s10}</b></div>
+<div class="note" style="margin:0 0 8px">A strong buying day needs {lvl(last['thr_up'])}+ stocks up 4% or more on rising
+volume; a strong selling day {lvl(last['thr_dn'])}+ down.</div>
+<div class="row"><span class="dim">Up vs down, last 5 days</span><b class="{rc(r5, last['r5_hi'], last['r5_lo'])}">{num(r5, 1)}&times;</b></div>
+<div class="row"><span class="dim">Up vs down, last 10 days</span><b class="{rc(r10, last['r10_hi'], last['r10_lo'])}">{num(r10, 1)}&times;</b></div>
+<div class="note" style="margin:4px 0 0">Stocks up 4% for every one down 4%. Normal is about {num(last['r5_med'], 1)}&times;;
+above {num(last['r5_hi'], 1)}&times; is very strong buying, below {num(last['r5_lo'], 1)}&times; is heavy selling.</div></div>
 </div>"""
 
 
@@ -1866,7 +1886,7 @@ def _mm_divergence(mm, reg, nifty, seg, gap_lim=15, lead_gap=10, off_high=3.0, n
     """
     rows = [(k, v) for k, v in (seg or {}).items() if v is not None]
     if nifty is None or not rows or "Nifty 50" not in (seg or {}) or "Smallcap 250" not in seg:
-        return '<div class="card"><div class="ttl">Large vs small caps</div><div class="note">Index data unavailable today.</div></div>'
+        return '<div class="card"><div class="ttl">Big vs small companies</div><div class="note">Index data unavailable today.</div></div>'
     ix = nifty.reindex(mm.index).ffill()
     dd = (ix / ix.rolling(20, min_periods=10).max() - 1) * 100
     p50 = {k: v["p50"].reindex(mm.index) for k, v in rows}
@@ -1883,26 +1903,26 @@ def _mm_divergence(mm, reg, nifty, seg, gap_lim=15, lead_gap=10, off_high=3.0, n
                      f"{p50['Smallcap 250'].iloc[-1]:.0f}% in 10 days)." if sc_ >= 0 else
                      f"Small caps are falling behind ({p50['Smallcap 250'].iloc[-11]:.0f}% &rarr; "
                      f"{p50['Smallcap 250'].iloc[-1]:.0f}%).")
-            alert = ("Large caps leading the index", "amb",
-                     f"Nifty near its high with Nifty 50 participation {g:.0f} points above small caps. {trend} "
-                     f"In Nov 2025 &ndash; Feb 2026 this set-up came before a lower Nifty 20 days later "
-                     f"in all 11 cases (one stretch of market &mdash; treat as a caution).")
+            alert = ("Big companies leading", "amb",
+                     f"The Nifty is near its high mainly because of big companies: "
+                     f"{p50['Nifty 50'].iloc[-1]:.0f}% of Nifty 50 stocks are in an uptrend vs "
+                     f"{p50['Smallcap 250'].iloc[-1]:.0f}% of small caps. {trend} From Nov 2025 to Feb 2026 this "
+                     f"came before a dip every time (11 of 11), so be a little careful.")
         elif d <= -off_high and g <= -lead_gap and washed.iloc[-1]:
-            alert = ("Small caps leading out of the low", "ok",
-                     f"Nifty {d:.1f}% off its 20-day high but small caps are {-g:.0f} points ahead in "
-                     f"participation after a washed-out market. Both times in 2026 (25 Mar, 1 Apr) the Nifty "
-                     f"was 3&ndash;6% higher 20 days later.")
+            alert = ("Small caps leading the recovery", "ok",
+                     f"The Nifty is {-d:.1f}% below its recent high, but small caps are recovering faster after a "
+                     f"big sell-off. Both times this happened in 2026, the Nifty was 3&ndash;6% higher a month later.")
         elif d <= -off_high and g <= -lead_gap and st.iloc[-1] in (0, 1, 2) and green20.iloc[-1]:
-            alert = ("Large caps leading the decline", "bad",
-                     f"Nifty {d:.1f}% off its 20-day high while breadth still holds (small caps {-g:.0f} points "
-                     f"ahead). In 2026 this came before further falls 4 times out of 7 (e.g. 8 Sep). Watch "
-                     f"Nifty 750 and tighten exits.")
+            alert = ("Big companies dragging the index down", "bad",
+                     f"The Nifty is {-d:.1f}% below its recent high because big companies are falling, while most "
+                     f"other stocks still look fine. In 2026 this came before further falls 4 times out of 7. "
+                     f"Watch Nifty 750 and tighten exits.")
     style = {"ok": "background:#dcfce7;color:#15803d", "bad": "background:#fee2e2;color:#b91c1c",
              "amb": "background:#fef3c7;color:#b45309"}
     head = (f'<div style="margin:10px 0 4px"><span class="tag" style="{style[alert[1]]}">{alert[0]}</span></div>'
             f'<div class="note" style="margin:0 0 8px">{alert[2]}</div>') if alert else \
            ('<div style="margin:10px 0 4px"><span class="tag" style="background:#f3f4f6;color:#374151">'
-            'No divergence</span></div>')
+            'Big and small moving together</span></div>')
     def ret20(lvl):
         x = lvl.reindex(mm.index).ffill()
         return (x.iloc[-1] / x.iloc[-21] - 1) * 100 if len(x) > 21 and x.iloc[-21] > 0 else np.nan
@@ -1914,9 +1934,11 @@ def _mm_divergence(mm, reg, nifty, seg, gap_lim=15, lead_gap=10, off_high=3.0, n
         f'<b class="{"pos" if perf[k] >= 0 else "neg"}">{perf[k]:+.1f}%</b></span></div>'
         for k, _ in rows if not _missing(p50[k].iloc[-1]) and not _missing(perf[k]))
     lead = max(((k, perf[k]) for k, _ in rows if not _missing(perf[k])), key=lambda t: t[1], default=None)
-    lead_txt = f"Leading over 20 days: <b>{lead[0]}</b>." if lead else ""
-    return f"""<div class="card"><div class="ttl">Large vs small caps</div>{head}
-<div class="note" style="margin:0 0 2px">% above 50-day average (10-day change) &middot; 20-day return, equal-weighted</div>
+    lead_txt = f"Doing best over the last 20 days: <b>{lead[0]}</b>." if lead else ""
+    tip = ("Compares the Nifty 50 with mid and small caps. Uptrend = price above its 50-day average. Returns are "
+           "averages of the member stocks.")
+    return f"""<div class="card"><div class="ttl">Big vs small companies <span class="dim" title="{tip}" style="cursor:help">&#9432;</span></div>{head}
+<div class="note" style="margin:0 0 2px">% of stocks in an uptrend (change over 10 days) &middot; return over the last 20 days</div>
 {body}<div class="note" style="margin:6px 0 0">{lead_txt}</div></div>"""
 
 
@@ -1950,12 +1972,12 @@ def _mm_chart(mm, nifty, days=252, seg=None, ohlc=None):
     return f"""<div class="card mmc" data-d="{payload}">
 <div class="mtop"><div class="mminfo"></div><div class="tabs"><div class="seg mmmode"><button data-k="line" class="on">Line</button><button data-k="candle">Candles</button></div><div class="seg mmcmp"><button data-k="sm" class="on">Smallcap 250</button><button data-k="md">Midcap 150</button><button data-k="">Off</button></div><div class="seg mmrng">{rng}</div></div></div>
 <svg class="mmsvg" preserveAspectRatio="xMidYMid meet"></svg>
-<div class="note">Nifty 50 against the daily verdict: <span class="pos">green</span> background = buying
-dominates, <span class="neg">red</span> = selling dominates, yellow = mixed, <span class="pos">green stripes</span> =
-turning up? (buying thrust from oversold, not yet confirmed), <span class="neg">red stripes</span> = turning down?. &#9650; = buying-thrust day,
-&#9660; = selling-thrust day. <span style="color:#ea580c">Dashed orange</span> = Smallcap 250 or
-Midcap 150 (equal-weighted from their member stocks, rebased to the Nifty at the start of the view) &mdash;
-when the two lines split, large and small caps are diverging. A change of background colour is a change in sentiment. Hover any day to
+<div class="note">Black line (or candles) = Nifty 50. Background = the market mood that day:
+<span class="pos">green</span> buyers in control, <span class="neg">red</span> sellers in control, yellow mixed,
+<span class="pos">green stripes</span> a possible turn up, <span class="neg">red stripes</span> a possible turn down. &#9650; = strong buying day,
+&#9660; = strong selling day. <span style="color:#ea580c">Dashed orange</span> = small caps (or mid caps),
+started at the same point as the Nifty so you can compare &mdash; when the lines split, big and small
+companies are moving differently. A change of background colour is a change in mood. Hover any day to
 read its numbers.</div></div>"""
 
 
@@ -1985,7 +2007,7 @@ def _mm_table(mm, index, rows=252, show=21):
 <th>10-day<br>ratio</th><th>Up 25%+<br>in a quarter</th><th>Down 25%+<br>in a quarter</th>
 <th>Up 25%+<br>in a month</th><th>Down 25%+<br>in a month</th><th>Up 50%+<br>in a month</th>
 <th>Down 50%+<br>in a month</th><th>Up 13%+<br>in 34 days</th><th>Down 13%+<br>in 34 days</th>
-<th>Stock<br>universe</th><th>T2108<br>(% &gt; 40 MA)</th><th>Nifty 50</th></tr>
+<th>Stocks<br>counted</th><th>% in uptrend<br>(above 40-day avg)</th><th>Nifty 50</th></tr>
 {''.join(body)}</table></div></div>"""
 
 
@@ -1993,14 +2015,12 @@ def _mm_tab(monitors, nifty, cfg, seg=None, ohlc=None):
     """monitors = [(dropdown label, mm frame, subtitle note)]; the first one shows by default."""
     tp = cfg.get("thrust_pctile", 90)
     n750 = next(((label, mm) for label, mm, _ in monitors if label == "Nifty 750"), None)
-    sel, blocks = _switch([(label, f"""<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet
-across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session first</p>
-{_mm_read(mm, tp, n750 if label != "Nifty 750" else None, nifty, seg)}{_mm_chart(mm, nifty, seg=seg, ohlc=ohlc)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
+    sel, blocks = _switch([(label, f"""{_mm_read(mm, tp, n750 if label != "Nifty 750" else None, nifty, seg)}{_mm_chart(mm, nifty, seg=seg, ohlc=ohlc)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
                            for label, mm, note in monitors])
     return f"""<div class="uwrap">
 <div class="shead"><h2>Monitor</h2>{sel}</div>
 {blocks}
-<div class="note"><b>Up / down 4%+ today</b>: closed 4% or more above / below yesterday on
+<details class="more"><summary>How this page is calculated</summary><div class="note"><b>Up / down 4%+ today</b>: closed 4% or more above / below yesterday on
 volume higher than yesterday's and at least {cfg.get('min_volume', 100000):,} shares.
 <b>5 / 10-day ratio</b>: up-4% count &divide; down-4% count summed over 5 / 10 sessions; green
 when in the top 20% of the last year, red in the bottom 20%. (On NSE more stocks rise 4% than fall
@@ -2028,7 +2048,7 @@ buying thrust before it (faded within two weeks in May, Jul, Aug 2026: short tra
 a turning-up from a market that was not washed out (mostly failed in 2026); <i>Steady</i> = in between. Based on one year of data &mdash; a guide, not a guarantee.
 <b>Reading it</b>: funds can't hide. Day after day of buying, with back-to-back thrust days, is a
 breadth thrust &mdash; breakouts work and follow through. Day after day of selling is the mirror
-image. Use it to time breakouts, not to pick stocks.</div>
+image. Use it to time breakouts, not to pick stocks.</div></details>
 </div>"""
 
 
@@ -2184,7 +2204,7 @@ Action lists use the {_esc(universe)} universe.</p>"""
     tabs = [(name, h) for name, h in (("Monitor", extras.get("mm_html")),
                                       ("IPO screener", extras.get("ipo_html")),
                                       ("RVOL screener", extras.get("rvol_html")),
-                                      ("Manas Arora", extras.get("manas_html")),
+                                      ("Minervini", extras.get("manas_html")),
                                       ("Market breadth", breadth_html)) if h]
     tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
                      f'{_esc(name)}</button>' for i, (name, _) in enumerate(tabs))
@@ -2315,13 +2335,15 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
                 stt = int(reg["state"].iloc[-1])
                 verdict = {1: "Buying dominates", -1: "Selling dominates", 2: "Turning up?",
                            -2: "Turning down?"}.get(stt, "Mixed")
-                note = (f"<b>Market ({monitors[0][0]}): {verdict}</b> (score {reg['score'].iloc[-1]:.0f}). "
-                        f"Manas checks the market before any set-up and sizes down or sits out when "
-                        f"it is weak &mdash; breakouts follow through far more often when buying dominates.")
-            print(f"Manas screener: " + ", ".join(f"{k} {len(v)}" for k, v in tables.items()))
+                verdict = {"Buying dominates": "Buyers in control",
+                           "Selling dominates": "Sellers in control"}.get(verdict, verdict)
+                note = (f"<b>Market mood ({monitors[0][0]}): {verdict}</b> (strength "
+                        f"{reg['score'].iloc[-1]:.0f}/100). Check the market before any set-up: size down or sit "
+                        f"out when it is weak &mdash; breakouts work far more often when buyers are in control.")
+            print(f"Minervini screener: " + ", ".join(f"{k} {len(v)}" for k, v in tables.items()))
             extras["manas_html"] = _manas_tab(tables, frames, manas, note)
         except Exception as e:
-            print(f"  [warn] Manas screener failed: {e}", file=sys.stderr)
+            print(f"  [warn] Minervini screener failed: {e}", file=sys.stderr)
             extras["manas_html"] = f'<div class="card note" style="margin-top:16px">Screener failed: {_esc(e)}</div>'
 
 
@@ -2403,6 +2425,8 @@ MANAS_SCREENER = dict(
     pullback_min_pct=4.0,       # 2A: 4-20% off the 15-day high, at the 21 EMA
     pullback_max_pct=20.0,
     breakout_vol_x=1.5,         # breakout volume vs the 20-day average
+    max_breakout_risk_pct=6.0,  # breakouts with the day's low further than this go to "extended - wait"
+    min_turnover_cr=2.0,        # liquidity: 20-day average traded value, Rs crore
     pre_breakout_pct=3.0,       # pre-breakout: within 3% of the 20-day high ...
     base_range_pct=10.0,        # ... with a 10-day range of 10% or less
     show_charts=True,
