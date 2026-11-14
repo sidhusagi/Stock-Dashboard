@@ -130,12 +130,33 @@ def _chunks(seq, size):
 
 
 def _drop_partial_sessions(closes, volumes, min_frac=0.5):
-    # yfinance can append a session that only a handful of tickers have printed yet
+    # yfinance can append a session that only a handful of tickers have printed yet, and it
+    # sometimes carries rows for exchange holidays (e.g. 15 Jan 2026) with little or no volume
     counts = closes.notna().sum(axis=1)
     keep = counts >= counts.max() * min_frac
+    traded = (volumes.reindex(index=closes.index, columns=closes.columns) > 0).sum(axis=1)
+    quiet = traded < traded[keep].median() * min_frac
     for d in closes.index[~keep][-3:]:
         print(f"  [warn] dropped {d:%d %b}: only {counts[d]} of {counts.max()} stocks have a close yet "
               f"- rerun with REFRESH = True later", file=sys.stderr)
+    for d in closes.index[keep & quiet]:
+        print(f"  [warn] dropped {d:%d %b %Y}: only {traded[d]} stocks traded - looks like a holiday row",
+              file=sys.stderr)
+    keep &= ~quiet
+    return closes[keep], volumes.reindex(index=closes.index[keep], columns=closes.columns)
+
+
+def _match_calendar(closes, volumes, index):
+    """Keep only sessions the Nifty 50 traded (plus any after its last print).
+
+    Yahoo sometimes has stock rows for NSE holidays, e.g. 15 Jan 2026 (Maharashtra civic
+    polls); one such row breaks every 40/65-day window it touches.
+    """
+    if index is None or index.empty:
+        return closes, volumes
+    keep = closes.index.isin(index.index) | (closes.index > index.index.max())
+    for d in closes.index[~keep]:
+        print(f"  [warn] dropped {d:%d %b %Y}: Nifty 50 did not trade (exchange holiday)", file=sys.stderr)
     return closes[keep], volumes.reindex(index=closes.index[keep], columns=closes.columns)
 
 
@@ -304,11 +325,11 @@ def market_monitor(closes, volumes, min_volume=100000, ma_days=40, thrust_pctile
         out[f"r{days}"] = (out["up4"].rolling(days).sum()
                            / out["dn4"].rolling(days).sum().replace(0, np.nan))
     for key, n, move in MM_RANGES:
-        lo = closes.rolling(n, min_periods=n).min()
-        hi = closes.rolling(n, min_periods=n).max()
+        lo = closes.rolling(n, min_periods=n - 3).min()   # a few gaps allowed (suspensions,
+        hi = closes.rolling(n, min_periods=n - 3).max()   # missing Yahoo days)
         out[f"{key}_up"] = (closes / lo >= 1 + move).sum(axis=1)
         out[f"{key}_dn"] = (closes / hi <= 1 - move).sum(axis=1)
-    sma = closes.rolling(ma_days, min_periods=ma_days).mean()
+    sma = closes.rolling(ma_days, min_periods=ma_days - 3).mean()
     out["t2108"] = (closes > sma).sum(axis=1) / sma.notna().sum(axis=1).replace(0, np.nan) * 100.0
     # NSE's own "normal" for the ratios: on NSE more stocks rise 4% than fall on most days,
     # so Stockbee's fixed 2 / 0.5 would read nearly every day as strong buying.
@@ -1179,7 +1200,7 @@ function mk(p,t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttr
 function txt(p,x,y,s,a){var e=mk(p,'text',Object.assign({x:x,y:y,'font-size':11,fill:'#6b7280'},a||{}));e.textContent=s;return e;}
 function fd(s){var p=s.split('-');return (+p[2])+' '+MON[+p[1]-1]+' '+p[0];}
 function fn(v,dp){return ok(v)?v.toLocaleString('en-IN',{minimumFractionDigits:dp||0,maximumFractionDigits:dp||0}):'\u2013';}
-function info(box,D,i){var s=D.s[i],tag=s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
+function info(box,D,i){var s=D.s[i],tag=s===2?['Turning up?','pos']:s===-2?['Turning down?','neg']:s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
  box.querySelector('.mminfo').innerHTML='<b>'+fd(D.d[i])+'</b> &middot; <b class="'+tag[1]+'">'+tag[0]+'</b>'
   +(ok(D.sc[i])?' <span class="dim">(score '+fn(D.sc[i])+')</span>':'')
   +' &middot; Nifty '+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
@@ -1188,6 +1209,9 @@ function info(box,D,i){var s=D.s[i],tag=s>0?['Buying dominates','pos']:s<0?['Sel
 function draw(box,D,span){
  var svg=box.querySelector('svg');while(svg.firstChild)svg.removeChild(svg.firstChild);
  svg.setAttribute('viewBox','0 0 '+W+' '+H);
+ var defs=mk(svg,'defs',{});[['mmTu','#86efac'],['mmTd','#fca5a5']].forEach(function(p){
+   var pt=mk(defs,'pattern',{id:p[0],width:8,height:8,patternUnits:'userSpaceOnUse',patternTransform:'rotate(45)'});
+   mk(pt,'rect',{width:8,height:8,fill:'#ffffff'});mk(pt,'rect',{width:4,height:8,fill:p[1]});});
  var N=D.d.length,i0=Math.max(0,N-span),n=N-i0,step=PW/n;
  function X(i){return L+(i-i0+0.5)*step;}
  var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){var v=D.ix[i];if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}}
@@ -1195,7 +1219,7 @@ function draw(box,D,span){
  function Y(v){return T+(1-(v-lo)/(hi-lo))*PH;}
  // background = daily verdict
  for(var i=i0;i<N;i++){var s=D.s[i];mk(svg,'rect',{x:X(i)-step/2,y:T,width:step+0.5,height:PH,
-   fill:s>0?'#dcfce7':s<0?'#fee2e2':'#fef9c3'});}
+   fill:s===2?'url(#mmTu)':s===-2?'url(#mmTd)':s>0?'#dcfce7':s<0?'#fee2e2':'#fef9c3'});}
  // grid + y labels
  for(var k=0;k<=4;k++){var v=lo+(hi-lo)*k/4,yy=Y(v);mk(svg,'line',{x1:L,x2:L+PW,y1:yy,y2:yy,stroke:'#ffffff','stroke-width':1});
    txt(svg,L-6,yy+4,fn(v,0),{'text-anchor':'end'});}
@@ -1399,26 +1423,123 @@ def mm_regime(mm, lookback=252):
                           "t2108_trend": _prank(mm["t2108"].diff(10), lookback),
                           "prim_trend": _prank(prim.diff(10), lookback)}, index=mm.index)
     score = parts.mean(axis=1, skipna=False) * 100
-    state = pd.Series(np.where(score >= 60, 1, np.where(score <= 40, -1, 0)), index=mm.index)
     buy, sell = mm["up4"] > mm["dn4"], mm["dn4"] > mm["up4"]
     bthr = (buy & (mm["up4"] >= mm["thr_up"])).astype(int)
     sthr = (sell & (mm["dn4"] >= mm["thr_dn"])).astype(int)
+    state = _mm_states(score, bthr, sthr)
     return pd.concat([parts * 100, pd.DataFrame({
-        "score": score, "state": state.where(score.notna(), 0).astype(int),
-        "b10": bthr.rolling(10, min_periods=1).sum(), "s10": sthr.rolling(10, min_periods=1).sum()},
+        "score": score, "state": state,
+        "b10": bthr.rolling(10, min_periods=1).sum(), "s10": sthr.rolling(10, min_periods=1).sum(),
+        "bthr": bthr, "sthr": sthr},
         index=mm.index)], axis=1)
 
 
-def _mm_read(mm, pctile):
+def _mm_states(score, bthr, sthr, hold=10, enter=(60, 40), leave=(55, 45), oversold=30, overbought=70):
+    """Daily verdict: 1 buying, -1 selling, 0 mixed, 2 turning up?, -2 turning down?
+
+    The score is slow (10-day windows), so two faster rules sit on top of it:
+      * Thrust confirmation - 2+ buying thrusts within 5 sessions, the latest thrust being a
+        buying one, switches to buying at once and holds for `hold` sessions unless a selling
+        thrust comes. Selling is the mirror image.
+      * Turning - a buying thrust while the score was oversold (<= 30 the day before) flags
+        "turning up?" until confirmed, cancelled by a selling thrust, or `hold` sessions pass.
+        It is an early warning only: in Mar 2026 it fired 2-3 weeks before the real low.
+    Otherwise the score decides, with a buffer: buying starts at 60 and lasts until it drops
+    below 55 (selling: starts at 40, lasts until above 45). Checked on Feb-Nov 2026 NSE data.
+    """
+    last = pd.Series(np.where(bthr == 1, 1, np.where(sthr == 1, -1, np.nan)), index=score.index).ffill()
+    b_ok = ((bthr.rolling(5, min_periods=1).sum() >= 2) & (last == 1)).values
+    s_ok = ((sthr.rolling(5, min_periods=1).sum() >= 2) & (last == -1)).values
+    sc, prev, b, s_ = score.values, score.shift(1).values, bthr.values, sthr.values
+    out, st, lock, turn, t0 = np.zeros(len(sc), int), 0, -1, 0, 0
+    for i, x in enumerate(sc):
+        if b_ok[i]:
+            st, lock = 1, i + hold
+        elif s_ok[i]:
+            st, lock = -1, i + hold
+        elif lock >= i and ((st == 1 and s_[i]) or (st == -1 and b[i])):
+            lock = -1                                    # an opposite thrust ends the hold
+        if lock < i and not np.isnan(x):
+            if st == 1:
+                st = -1 if x <= enter[1] else (0 if x < leave[0] else 1)
+            elif st == -1:
+                st = 1 if x >= enter[0] else (0 if x > leave[1] else -1)
+            else:
+                st = 1 if x >= enter[0] else (-1 if x <= enter[1] else 0)
+        if turn == 1 and (s_[i] or st == 1 or i - t0 >= hold):
+            turn = 0
+        if turn == -1 and (b[i] or st == -1 or i - t0 >= hold):
+            turn = 0
+        if b[i] and prev[i] <= oversold and st != 1:
+            turn, t0 = 1, i
+        if s_[i] and prev[i] >= overbought and st != -1:
+            turn, t0 = -1, i
+        out[i] = 2 * turn if turn and st != turn else st
+    return pd.Series(out, index=score.index)
+
+
+def mm_green_type(mm, reg, washed=15, late=45):
+    """What kind of green is today's? (label, cls, note) or None when not green / turning up.
+
+    From the Feb-Nov 2026 back-check (small sample - a guide, not a rule):
+      fresh - the green run began within 10 sessions of T2108 at or below `washed` and has 2+
+              buying thrusts: 24 Mar, 1 Apr, 27 Oct and 2 Nov 2026 all led to 7-11% Nifty moves.
+      late  - began with T2108 already at `late`+ and at most 1 buying thrust in the 10 sessions
+              before: 26 May, 10 Jul, 3 Aug, 26 Aug 2026 - Nifty 2-3% lower 10 sessions later.
+      steady - anything else (e.g. 12 Jun 2026: +3.4% over 16 sessions).
+    """
+    st = reg["state"]
+    if st.iloc[-1] not in (1, 2):
+        return None
+    on = (st > 0).values
+    i0 = len(on) - 1
+    while i0 > 0 and on[i0 - 1]:
+        i0 -= 1
+    start = st.index[i0]
+    t = mm["t2108"]
+    t_low, t_start = t.iloc[max(0, i0 - 10):i0 + 1].min(), t.iloc[i0]
+    thr_since = int(reg["bthr"].iloc[max(0, i0 - 9):].sum())
+    thr_before = int(reg["bthr"].iloc[max(0, i0 - 9):i0 + 1].sum())
+    if t_low <= washed and thr_since >= 2:
+        return ("Fresh green &middot; multi-week potential", "ok",
+                f"Began {start:%d %b} from a washed-out market (T2108 low {t_low:.0f}) with {thr_since} buying "
+                f"thrusts. Starts like this led the Apr and Nov 2026 rallies. Hold while green; the first "
+                f"warning is Nifty 750 turning red.")
+    if t_low <= washed:
+        return ("Fresh but unconfirmed", "amb",
+                f"From a washed-out market (T2108 low {t_low:.0f}) but only {thr_since} buying thrust so far. "
+                f"A second thrust confirms it; in Mar 2026 two such starts failed before the real low.")
+    if st.iloc[-1] == 2:
+        return ("Bounce attempt &middot; short trades", "bad",
+                f"A buying thrust, but T2108 only fell to {t_low:.0f} (not washed out). Turns like this on "
+                f"10 Mar, 18 Sep and 6 Oct 2026 mostly failed &mdash; quick trades only until it confirms.")
+    if t_start >= late and thr_before <= 1:
+        return ("Late green &middot; short trades", "bad",
+                f"Began {start:%d %b} with T2108 already at {t_start:.0f} and {thr_before} buying thrust"
+                f"{'' if thr_before == 1 else 's'} before it. Greens like this faded within two weeks in May, "
+                f"Jul and Aug 2026 &mdash; take quick profits, keep stops tight.")
+    return ("Steady green", "",
+            f"Began {start:%d %b} (T2108 {t_start:.0f}, {thr_since} buying thrusts since). Neither washed-out "
+            f"nor late: hold while green and watch Nifty 750 for the first warning.")
+
+
+def _mm_read(mm, pctile, other=None):
     """Today's read: sentiment verdict, its score and parts, thrust days and the ratios."""
     last = mm.iloc[-1]
     reg = mm_regime(mm)
     now = reg.iloc[-1]
     b10, s10 = int(now["b10"]), int(now["s10"])
     r5, r10 = last["r5"], last["r10"]
-    state = int(now["state"])
+    state = int(now["state"])   # 2 / -2 = turning up / down (early, unconfirmed)
     since = reg.index[-_mm_streak(reg["state"] == state)]   # when sentiment last changed
-    if state > 0:
+    if state == 2:
+        verdict, cls, msg = "Turning up?", "ok", ("A buying thrust from oversold &mdash; an early sign funds are "
+                                               "stepping in. Not confirmed yet: wait for a second thrust or a "
+                                               "rising score, and expect false starts.")
+    elif state == -2:
+        verdict, cls, msg = "Turning down?", "bad", ("A selling thrust from an overbought market &mdash; an early "
+                                                   "warning. Not confirmed yet: tighten stops, go easy on new buys.")
+    elif state > 0:
         verdict, cls, msg = "Buying dominates", "ok", "Funds are buying. Breakouts tend to work and follow through."
     elif state < 0:
         verdict, cls, msg = "Selling dominates", "bad", "Funds are selling. Breakouts tend to fail; protect capital."
@@ -1426,6 +1547,21 @@ def _mm_read(mm, pctile):
         verdict, cls, msg = "Mixed", "amb", "Neither side in control. Breakouts are less reliable; be selective."
     tag = f'<span class="tag {cls}">{verdict}</span>' if cls != "amb" else \
           f'<span class="tag" style="background:#fef3c7;color:#b45309">{verdict}</span>'
+    extra = ""
+    gt = mm_green_type(mm, reg)
+    if gt:
+        lab, gcls, note = gt
+        style = {"ok": "background:#dcfce7;color:#15803d", "bad": "background:#fee2e2;color:#b91c1c",
+                 "amb": "background:#fef3c7;color:#b45309"}.get(gcls, "background:#f3f4f6;color:#374151")
+        extra += (f'<div style="margin-top:10px"><span class="tag" style="{style}">{lab}</span></div>'
+                  f'<div class="note" style="margin:4px 0 0">{note}</div>')
+    if other is not None and state > 0:
+        o_name, o_mm = other
+        o_state = int(mm_regime(o_mm)["state"].iloc[-1])
+        if o_state < 0:
+            extra += (f'<div class="note" style="margin:8px 0 0;color:#b91c1c"><b>Warning:</b> {o_name} is '
+                      f'already {"turning down" if o_state == -2 else "red"} &mdash; larger stocks are weakening '
+                      f'first (in Aug 2026 it turned red 4 weeks before this list). Tighten exits.</div>')
     lvl = lambda v: "&ndash;" if _missing(v) else f"{int(v):,}"
     num = lambda v, dp=2: "&ndash;" if _missing(v) else f"{v:.{dp}f}"
     part = lambda k, lab: (f'<div class="row"><span class="dim">{lab}</span>'
@@ -1435,9 +1571,9 @@ def _mm_read(mm, pctile):
     return f"""<div class="grid g4 mmread">
 <div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}
 <span class="cnt">since {since:%d %b}</span></div>
-<div class="note" style="margin:0">{msg}</div></div>
+<div class="note" style="margin:0">{msg}</div>{extra}</div>
 <div class="card"><div class="ttl">Sentiment score</div>
-<div class="big {"pos" if state > 0 else "neg" if state < 0 else "amb"}">{num(sc, 0)}
+<div class="big {"pos" if state == 1 else "neg" if state == -1 else "amb"}">{num(sc, 0)}
 <span class="dim" style="font-size:14px;font-weight:400">/ 100</span></div>
 <div class="note" style="margin:0 0 4px">60+ buying &middot; 40 or less selling &middot; each part ranked vs its past year</div>
 {part("bal", "4% balance, 10 days")}{part("t2108", "T2108 level")}
@@ -1479,7 +1615,8 @@ def _mm_chart(mm, nifty, days=252):
 <div class="mtop"><div class="mminfo"></div><div class="seg mmrng">{rng}</div></div>
 <svg class="mmsvg" preserveAspectRatio="xMidYMid meet"></svg>
 <div class="note">Nifty 50 against the daily verdict: <span class="pos">green</span> background = buying
-dominates, <span class="neg">red</span> = selling dominates, yellow = mixed. &#9650; = buying-thrust day,
+dominates, <span class="neg">red</span> = selling dominates, yellow = mixed, <span class="pos">green stripes</span> =
+turning up? (buying thrust from oversold, not yet confirmed), <span class="neg">red stripes</span> = turning down?. &#9650; = buying-thrust day,
 &#9660; = selling-thrust day. A change of background colour is a change in sentiment. Hover any day to
 read its numbers.</div></div>"""
 
@@ -1517,9 +1654,10 @@ def _mm_table(mm, index, rows=252, show=21):
 def _mm_tab(monitors, nifty, cfg):
     """monitors = [(dropdown label, mm frame, subtitle note)]; the first one shows by default."""
     tp = cfg.get("thrust_pctile", 90)
+    n750 = next(((label, mm) for label, mm, _ in monitors if label == "Nifty 750"), None)
     sel, blocks = _switch([(label, f"""<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet
 across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session first</p>
-{_mm_read(mm, tp)}{_mm_chart(mm, nifty)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
+{_mm_read(mm, tp, n750 if label != "Nifty 750" else None)}{_mm_chart(mm, nifty)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
                            for label, mm, note in monitors])
     return f"""<div class="uwrap">
 <div class="shead"><h2>Monitor</h2>{sel}</div>
@@ -1541,7 +1679,15 @@ would not carry over. The longer-range pairs are green or red by which side is b
 <b>Sentiment score / background colour</b>: the average of four parts, each ranked 0&ndash;100
 against its own last year &mdash; the 10-day 4% balance, T2108, T2108's 10-day change and the
 10-day change in the quarter's up-25% vs down-25% balance. 60+ = buying dominates, 40 or less =
-selling dominates. These rules are ours, built on Stockbee's indicators.
+selling dominates; once in, a side holds until the score crosses 55 / 45. Because the score is
+slow, thrusts act faster: two buying thrusts within 5 sessions (the latest one a buying thrust)
+turn it green at once for at least 10 sessions, and a single buying thrust from an oversold market
+shows <i>Turning up?</i> as an early warning (expect false starts). Selling is the mirror image.
+These rules are ours, built on Stockbee's indicators and checked on Feb&ndash;Nov 2026 NSE data.
+<b>Type of green</b>: <i>Fresh</i> = began within 10 sessions of T2108 at 15 or below, with 2+ buying
+thrusts (multi-week moves in Apr and Nov 2026); <i>Late</i> = began with T2108 at 45+ and at most one
+buying thrust before it (faded within two weeks in May, Jul, Aug 2026: short trades); <i>Bounce attempt</i> =
+a turning-up from a market that was not washed out (mostly failed in 2026); <i>Steady</i> = in between. Based on one year of data &mdash; a guide, not a guarantee.
 <b>Reading it</b>: funds can't hide. Day after day of buying, with back-to-back thrust days, is a
 breadth thrust &mdash; breakouts work and follow through. Day after day of selling is the mirror
 image. Use it to time breakouts, not to pick stocks.</div>
@@ -1737,6 +1883,8 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
     """
     symbols, industries = fetch_universe()
     closes, volumes = load_prices(symbols, period=period, refresh=refresh)
+    nifty = load_index("^NSEI", period=period, refresh=refresh)
+    closes, volumes = _match_calendar(closes, volumes, nifty)
 
     panels = segment_panels(closes)
     keys = {"all": "TOTAL MARKET", "n50": "Nifty 50", "large": "Nifty 100 (large)",
@@ -1765,7 +1913,7 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
         "action": daily_action(panel, vol, rs_ratings(closes)),
         "internals": {name: breadth_of(key) for name, key in INTERNALS_UNIVERSES if key in panels},
         "ad": {name: breadth_of(key) for name, key in AD_UNIVERSES if key in panels},
-        "nifty": load_index("^NSEI", period=period, refresh=refresh),
+        "nifty": nifty,
     }
 
     if monitor is not None:
