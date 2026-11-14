@@ -53,6 +53,7 @@ import io
 import json
 import logging
 import os
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -151,10 +152,15 @@ def _prices_fresh(path):
     return datetime.fromtimestamp(os.path.getmtime(path), IST) >= cutoff
 
 
-def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True):
-    """(closes, volumes) [dates x tickers] panels, cached as gzipped CSV so re-runs are instant."""
+def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True, tag=""):
+    """(closes, volumes) [dates x tickers] panels, cached as gzipped CSV so re-runs are instant.
+
+    Plain symbols get ".NS"; symbols already ending in ".NS" / ".BO" are used as they are.
+    `tag` keeps a second universe's cache apart from the main one.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    paths = {k: os.path.join(CACHE_DIR, f"{k}_{period}.csv.gz") for k in ("closes", "volumes")}
+    paths = {k: os.path.join(CACHE_DIR, f"{k}{'_' + tag if tag else ''}_{period}.csv.gz")
+             for k in ("closes", "volumes")}
     fresh = all(_prices_fresh(p) for p in paths.values())
     if fresh and not refresh:
         if verbose:
@@ -162,19 +168,23 @@ def load_prices(symbols, period="2y", refresh=False, batch_size=60, verbose=True
         return _drop_partial_sessions(*(pd.read_csv(paths[k], index_col=0, parse_dates=True)
                                         for k in ("closes", "volumes")))
 
-    tickers = [f"{s}.NS" for s in symbols]
+    tickers = [s if s.endswith((".NS", ".BO")) else f"{s}.NS" for s in symbols]
     if verbose:
-        print(f"Downloading {period} of daily closes and volumes for {len(tickers)} NSE stocks "
+        print(f"Downloading {period} of daily closes and volumes for {len(tickers)} stocks "
               f"(one-off; cached for the rest of the day)...")
 
     close_frames, volume_frames = [], []
     for n, batch in enumerate(_chunks(tickers, batch_size), 1):
-        try:
-            data = yf.download(batch, period=period, interval="1d", auto_adjust=True,
-                               group_by="column", threads=True, progress=False)
-        except Exception as e:
-            print(f"  [warn] batch {n} failed: {e}", file=sys.stderr)
-            continue
+        data = None
+        for attempt in (1, 2):
+            try:
+                data = yf.download(batch, period=period, interval="1d", auto_adjust=True,
+                                   group_by="column", threads=True, progress=False)
+            except Exception as e:
+                print(f"  [warn] batch {n} attempt {attempt} failed: {e}", file=sys.stderr)
+            if data is not None and not data.empty:
+                break
+            time.sleep(5)
         if data is None or data.empty:
             continue
         multi = isinstance(data.columns, pd.MultiIndex)
@@ -301,6 +311,63 @@ def market_monitor(closes, volumes, min_volume=100000, ma_days=40, thrust_pctile
     sma = closes.rolling(ma_days, min_periods=ma_days).mean()
     out["t2108"] = (closes > sma).sum(axis=1) / sma.notna().sum(axis=1).replace(0, np.nan) * 100.0
     return out.iloc[65:]   # first quarter has no 65-day lookback yet
+
+
+BSE_SCRIPS_URL = ("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
+                  "?Group=&Scripcode=&industry=&segment=Equity&status=Active")
+
+
+def _pick(row, *names):
+    """Value of the first matching key, ignoring case and spaces (the BSE API renames fields)."""
+    norm = {k.replace(" ", "").replace("_", "").lower(): v for k, v in row.items()}
+    for n in names:
+        v = norm.get(n.replace(" ", "").replace("_", "").lower())
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
+
+
+def fetch_full_market(nse_series=("EQ", "BE"), bse_exclude=("Z", "M")):
+    """(tickers, counts) for every active NSE + BSE main-board stock, each company once.
+
+    NSE: all symbols in the listed series (EQ = normal, BE = trade-for-trade; BZ, the
+    NSE Z category, is left out). BSE: every active equity scrip whose ISIN is not
+    already on NSE, minus groups starting with `bse_exclude` (Z = non-compliant,
+    M / MT = SME). If the BSE list can't be fetched we carry on with NSE only.
+    """
+    resp = _nse_session().get(EQUITY_LIST_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    nse, isins = [], set()
+    for raw in csv.DictReader(io.StringIO(resp.text)):
+        row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
+        if row.get("SERIES") in nse_series and row.get("SYMBOL"):
+            nse.append(f"{row['SYMBOL']}.NS")
+            isins.add(row.get("ISIN NUMBER", ""))
+    bse = []
+    try:
+        r = requests.get(BSE_SCRIPS_URL, timeout=60, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com",
+            "Accept": "application/json, text/plain, */*"})
+        r.raise_for_status()
+        rows = r.json()
+        rows = rows.get("Table", rows) if isinstance(rows, dict) else rows
+        for row in rows:
+            code = _pick(row, "SCRIP_CD", "Scrip_Code", "scripcode")
+            group = _pick(row, "GROUP", "Group", "Scrip_Group").upper()
+            isin = _pick(row, "ISIN_NUMBER", "ISIN", "ISIN No")
+            if not code.isdigit() or (isin and isin in isins):
+                continue
+            if any(group.startswith(g) for g in bse_exclude):
+                continue
+            bse.append(f"{code}.BO")
+            if isin:
+                isins.add(isin)
+    except Exception as e:
+        print(f"  [warn] BSE scrip list unavailable ({e}); Market Monitor uses NSE stocks only",
+              file=sys.stderr)
+    return sorted(set(nse)) + sorted(set(bse)), {"nse": len(set(nse)), "bse": len(set(bse))}
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +894,10 @@ border-bottom:2px solid transparent;background:none;color:var(--dim);cursor:poin
 .mm td.mm-g{background:#bbf7d0}.mm td.mm-g2{background:#16a34a;color:#fff;font-weight:600}
 .mm td.mm-r{background:#f08080}.mm td.mm-p{background:#fde2e2}
 .mmread{margin-bottom:16px}
+.mmc{margin-bottom:4px}.mmc .mtop{align-items:center;margin-bottom:6px}
+.mminfo{font-size:13px;line-height:1.5}.mmsvg{width:100%;height:auto;display:block}
+.mmscroll{max-height:640px;overflow:auto;padding-top:0}
+.mmscroll tr:nth-child(2) th{position:sticky;top:0;background:#fff;z-index:1}
 .mmread .card{padding:14px 16px}
 """
 
@@ -1135,6 +1206,72 @@ def _market_internals(b, nifty):
 PART_WINDOWS = (9, 21, 50, 200)
 
 # Draws every .mbi block: zone bands, Nifty 50 underlay, hover read-out on the left list.
+MM_JS = r"""
+(function(){
+var NS='http://www.w3.org/2000/svg',MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+var W=1200,H=340,L=64,R=14,T=12,B=26,PW=W-L-R,PH=H-T-B;
+function ok(v){return v!==null&&v!==undefined&&isFinite(v);}
+function mk(p,t,a){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e;}
+function txt(p,x,y,s,a){var e=mk(p,'text',Object.assign({x:x,y:y,'font-size':11,fill:'#6b7280'},a||{}));e.textContent=s;return e;}
+function fd(s){var p=s.split('-');return (+p[2])+' '+MON[+p[1]-1]+' '+p[0];}
+function fn(v,dp){return ok(v)?v.toLocaleString('en-IN',{minimumFractionDigits:dp||0,maximumFractionDigits:dp||0}):'\u2013';}
+function info(box,D,i){var s=D.s[i],tag=s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
+ box.querySelector('.mminfo').innerHTML='<b>'+fd(D.d[i])+'</b> &middot; <b class="'+tag[1]+'">'+tag[0]+'</b>'
+  +' &middot; Nifty '+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
+  +' <span class="dim">(thrust '+fn(D.tu[i])+' / '+fn(D.td[i])+')</span> &middot; 5d '+fn(D.r5[i],2)+' &middot; 10d '+fn(D.r10[i],2)
+  +' &middot; T2108 '+fn(D.t[i],1);}
+function draw(box,D,span){
+ var svg=box.querySelector('svg');while(svg.firstChild)svg.removeChild(svg.firstChild);
+ svg.setAttribute('viewBox','0 0 '+W+' '+H);
+ var N=D.d.length,i0=Math.max(0,N-span),n=N-i0,step=PW/n;
+ function X(i){return L+(i-i0+0.5)*step;}
+ var lo=Infinity,hi=-Infinity;for(var i=i0;i<N;i++){var v=D.ix[i];if(ok(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}}
+ if(!(hi>lo)){lo=0;hi=1;}var pad=(hi-lo)*0.12;lo-=pad;hi+=pad;
+ function Y(v){return T+(1-(v-lo)/(hi-lo))*PH;}
+ // background = daily verdict
+ for(var i=i0;i<N;i++){var s=D.s[i];mk(svg,'rect',{x:X(i)-step/2,y:T,width:step+0.5,height:PH,
+   fill:s>0?'#dcfce7':s<0?'#fee2e2':'#fef9c3'});}
+ // grid + y labels
+ for(var k=0;k<=4;k++){var v=lo+(hi-lo)*k/4,yy=Y(v);mk(svg,'line',{x1:L,x2:L+PW,y1:yy,y2:yy,stroke:'#ffffff','stroke-width':1});
+   txt(svg,L-6,yy+4,fn(v,0),{'text-anchor':'end'});}
+ // month ticks
+ var last='';for(var i=i0;i<N;i++){var m=D.d[i].slice(0,7);if(m!==last&&i>i0){var p=D.d[i].split('-');
+   mk(svg,'line',{x1:X(i)-step/2,x2:X(i)-step/2,y1:T+PH,y2:T+PH+4,stroke:'#9ca3af'});
+   txt(svg,X(i)-step/2,H-8,MON[+p[1]-1]+(p[1]==='01'?' '+p[0].slice(2):''),{'text-anchor':'middle'});}last=m;}
+ // Nifty line
+ var d='';for(var i=i0;i<N;i++){if(ok(D.ix[i]))d+=(d?'L':'M')+X(i).toFixed(1)+','+Y(D.ix[i]).toFixed(1);}
+ mk(svg,'path',{d:d,fill:'none',stroke:'#111827','stroke-width':1.8});
+ // thrust days: triangles above (buying) / below (selling) the line
+ var sz=Math.max(4,Math.min(7,step*0.9));
+ for(var i=i0;i<N;i++){if(!ok(D.ix[i]))continue;var x=X(i),y=Y(D.ix[i]),u=D.up[i],dn=D.dn[i];
+   if(ok(D.tu[i])&&u>dn&&u>=D.tu[i])mk(svg,'path',{d:'M'+x+','+(y+6)+'l'+(-sz)+','+(sz*1.6)+'h'+(2*sz)+'z',fill:'#15803d'});
+   if(ok(D.td[i])&&dn>u&&dn>=D.td[i])mk(svg,'path',{d:'M'+x+','+(y-6)+'l'+(-sz)+','+(-sz*1.6)+'h'+(2*sz)+'z',fill:'#b91c1c'});}
+ mk(svg,'rect',{x:L,y:T,width:PW,height:PH,fill:'none',stroke:'#e5e7eb'});
+ // hover
+ var cross=mk(svg,'line',{x1:0,x2:0,y1:T,y2:T+PH,stroke:'#111827',opacity:0});
+ var ov=mk(svg,'rect',{x:L,y:T,width:PW,height:PH,fill:'transparent'});
+ ov.addEventListener('mousemove',function(e){var r=svg.getBoundingClientRect(),vx=(e.clientX-r.left)*W/r.width;
+   var i=Math.max(i0,Math.min(N-1,i0+Math.floor((vx-L)/step)));
+   cross.setAttribute('x1',X(i));cross.setAttribute('x2',X(i));cross.setAttribute('opacity',0.4);info(box,D,i);});
+ ov.addEventListener('mouseleave',function(){cross.setAttribute('opacity',0);info(box,D,N-1);});
+ info(box,D,N-1);
+}
+document.querySelectorAll('.mmc').forEach(function(box){
+ var D=JSON.parse(box.dataset.d),btns=box.querySelectorAll('.mmrng button');
+ btns.forEach(function(b){b.addEventListener('click',function(){btns.forEach(function(x){x.classList.toggle('on',x===b);});
+   draw(box,D,+b.dataset.n);});});
+ draw(box,D,126);
+});
+document.querySelectorAll('.mmrows').forEach(function(seg){
+ var tbl=seg.closest('.mmtw').querySelector('table'),btns=seg.querySelectorAll('button');
+ btns.forEach(function(b){b.addEventListener('click',function(){var n=+b.dataset.n;
+   btns.forEach(function(x){x.classList.toggle('on',x===b);});
+   tbl.querySelectorAll('tr[data-i]').forEach(function(r){r.style.display=+r.dataset.i<n?'':'none';});});});
+});
+})();
+"""
+
+
 MB_JS = r"""
 (function(){
 var W=1000,H=300,PL=52,PR=8,PT=10,PB=26,PW=W-PL-PR,PH=H-PT-PB,RNG=[63,126,252];
@@ -1268,6 +1405,27 @@ def _mm_streak(flags):
     return n
 
 
+def mm_regime(mm):
+    """Day-by-day verdict: +1 buying dominates, -1 selling dominates, 0 mixed (our rules).
+
+    Buying: 5-day ratio >= 2, or back-to-back buying-thrust days in the last 5 sessions with
+    no selling thrust, or 10-day ratio >= 1.5 with 2+ buying thrusts and at most 1 selling
+    thrust in the last 10. Selling is the mirror image.
+    """
+    buy, sell = mm["up4"] > mm["dn4"], mm["dn4"] > mm["up4"]
+    bthr = (buy & (mm["up4"] >= mm["thr_up"])).astype(int)
+    sthr = (sell & (mm["dn4"] >= mm["thr_dn"])).astype(int)
+    roll = lambda x, n: x.rolling(n, min_periods=1)
+    b10, s10 = roll(bthr, 10).sum(), roll(sthr, 10).sum()
+    b2b_buy = roll(bthr & bthr.shift(1, fill_value=0), 5).max() > 0
+    b2b_sell = roll(sthr & sthr.shift(1, fill_value=0), 5).max() > 0
+    b5, s5 = roll(bthr, 5).max() > 0, roll(sthr, 5).max() > 0
+    buying = (mm["r5"] >= 2) | (b2b_buy & ~s5) | ((mm["r10"] >= 1.5) & (b10 >= 2) & (s10 <= 1))
+    selling = ~buying & ((mm["r5"] <= 0.5) | (b2b_sell & ~b5) | ((mm["r10"] <= 0.67) & (s10 >= 2) & (b10 <= 1)))
+    return pd.DataFrame({"state": buying.astype(int) - selling.astype(int),
+                         "buy": buy, "sell": sell, "b10": b10, "s10": s10}, index=mm.index)
+
+
 def _mm_read(mm, pctile):
     """Today's read: who dominates and for how long (Stockbee, 'Understand market breadth').
 
@@ -1276,20 +1434,16 @@ def _mm_read(mm, pctile):
     when buying dominates and fail when selling does. The verdict rules are ours.
     """
     last = mm.iloc[-1]
-    buy, sell = mm["up4"] > mm["dn4"], mm["dn4"] > mm["up4"]
-    bthr = buy & (mm["up4"] >= mm["thr_up"])
-    sthr = sell & (mm["dn4"] >= mm["thr_dn"])
-    buy_run, sell_run = _mm_streak(buy), _mm_streak(sell)
-    b10, s10 = int(bthr.tail(10).sum()), int(sthr.tail(10).sum())
-    b2b_buy = bool((bthr & bthr.shift(1, fill_value=False)).tail(5).any())   # back-to-back thrusts
-    b2b_sell = bool((sthr & sthr.shift(1, fill_value=False)).tail(5).any())
+    reg = mm_regime(mm)
+    buy_run, sell_run = _mm_streak(reg["buy"]), _mm_streak(reg["sell"])
+    b10, s10 = int(reg["b10"].iloc[-1]), int(reg["s10"].iloc[-1])
     r5, r10 = last["r5"], last["r10"]
-    ok = lambda v, f: not _missing(v) and f(v)
-    if ok(r5, lambda v: v >= 2) or (b2b_buy and not sthr.tail(5).any()) or \
-            (ok(r10, lambda v: v >= 1.5) and b10 >= 2 and s10 <= 1):
+    state = reg["state"].iloc[-1]
+    # how long the current verdict has held - the "change in sentiment" date
+    since = reg.index[-_mm_streak(reg["state"] == state)]
+    if state > 0:
         verdict, cls, msg = "Buying dominates", "ok", "Funds are buying. Breakouts tend to work and follow through."
-    elif ok(r5, lambda v: v <= 0.5) or (b2b_sell and not bthr.tail(5).any()) or \
-            (ok(r10, lambda v: v <= 0.67) and s10 >= 2 and b10 <= 1):
+    elif state < 0:
         verdict, cls, msg = "Selling dominates", "bad", "Funds are selling. Breakouts tend to fail; protect capital."
     else:
         verdict, cls, msg = "Mixed", "amb", "Neither side in control. Breakouts are less reliable; be selective."
@@ -1300,13 +1454,14 @@ def _mm_read(mm, pctile):
           f'<span class="tag" style="background:#fef3c7;color:#b45309">{verdict}</span>'
     lvl = lambda v: "&ndash;" if _missing(v) else f"{int(v):,}"
     return f"""<div class="grid g4 mmread">
-<div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}</div>
+<div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}
+<span class="cnt">since {since:%d %b}</span></div>
 <div class="note" style="margin:0">{msg}</div></div>
 <div class="card"><div class="ttl">Current run</div><div class="big">{n}</div>
 <div class="note" style="margin:0">{run_note}</div></div>
 <div class="card"><div class="ttl">Thrust days, last 10</div>
 <div class="big"><span class="pos">{b10}</span> <span class="dim" style="font-size:18px">vs</span> <span class="neg">{s10}</span></div>
-<div class="note" style="margin:0">NSE's &ldquo;300&rdquo; today: <b>{lvl(last['thr_up'])}+</b> up 4% for buying,
+<div class="note" style="margin:0">Today's &ldquo;300&rdquo;: <b>{lvl(last['thr_up'])}+</b> up 4% for buying,
 <b>{lvl(last['thr_dn'])}+</b> down 4% for selling (top {100 - pctile:g}% of the last year)</div></div>
 <div class="card"><div class="ttl">5 / 10-day ratio</div>
 <div class="big">{_sgn(r5).lstrip('+') if not _missing(r5) else '&ndash;'} <span class="dim" style="font-size:18px">/ {_sgn(r10).lstrip('+') if not _missing(r10) else '&ndash;'}</span></div>
@@ -1314,21 +1469,52 @@ def _mm_read(mm, pctile):
 </div>"""
 
 
-def _mm_table(mm, index, rows=30):
+def _mm_chart(mm, nifty, days=252):
+    """Skeleton + JSON for the stacked sentiment charts; MM_JS draws them."""
+    view = mm.tail(days)
+    reg = mm_regime(mm).reindex(view.index)
+    ix = nifty.reindex(view.index) if nifty is not None else pd.Series(np.nan, index=view.index)
+
+    def arr(x, dp=2):
+        return [round(float(v), dp) if pd.notna(v) and np.isfinite(v) else None for v in x]
+
+    data = {"d": [d.strftime("%Y-%m-%d") for d in view.index], "ix": arr(ix),
+            "up": arr(view["up4"], 0), "dn": arr(view["dn4"], 0),
+            "tu": arr(view["thr_up"], 0), "td": arr(view["thr_dn"], 0),
+            "r5": arr(view["r5"]), "r10": arr(view["r10"]),
+            "qu": arr(view["q25_up"], 0), "qd": arr(view["q25_dn"], 0),
+            "t": arr(view["t2108"], 1), "s": [int(v) for v in reg["state"]]}
+    payload = html.escape(json.dumps(data, allow_nan=False), quote=True)
+    rng = "".join(f'<button data-n="{n}"{" class=\"on\"" if n == 126 else ""}>{lab}</button>'
+                  for lab, n in (("3M", 63), ("6M", 126), ("1Y", 252)))
+    return f"""<div class="card mmc" data-d="{payload}">
+<div class="mtop"><div class="mminfo"></div><div class="seg mmrng">{rng}</div></div>
+<svg class="mmsvg" preserveAspectRatio="xMidYMid meet"></svg>
+<div class="note">Nifty 50 against the daily verdict: <span class="pos">green</span> background = buying
+dominates, <span class="neg">red</span> = selling dominates, yellow = mixed. &#9650; = buying-thrust day,
+&#9660; = selling-thrust day. A change of background colour is a change in sentiment. Hover any day to
+read its numbers.</div></div>"""
+
+
+def _mm_table(mm, index, rows=252, show=21):
     view = mm.tail(rows).iloc[::-1]
     idx = index.reindex(view.index) if index is not None else pd.Series(np.nan, index=view.index)
     body = []
-    for d, r in view.iterrows():
+    for i, (d, r) in enumerate(view.iterrows()):
         ratio = lambda v: _mm_cell(v, "mm-g" if v >= 2 else "mm-r" if v <= 0.5 else "", dp=2)
         t = r["t2108"]
         body.append(
-            f"<tr><td>{d:%d %b %Y}</td>" + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
+            f'<tr data-i="{i}"{"" if i < show else " style=\"display:none\""}><td>{d:%d %b %Y}</td>' + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
             + ratio(r["r5"]) + ratio(r["r10"])
             + "".join(_mm_pair(r[f"{k}_up"], r[f"{k}_dn"]) for k, _, _ in MM_RANGES)
             + _mm_cell(r["universe"])
             + _mm_cell(t, "mm-g" if t <= 20 else "mm-r" if t >= 80 else "", dp=2)
             + _mm_cell(idx.get(d), dp=2) + "</tr>")
-    return f"""<div class="card tscroll mm"><table>
+    btns = "".join(f'<button data-n="{n}"{" class=\"on\"" if n == show else ""}>{lab}</button>'
+                   for lab, n in (("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252)) if n <= max(rows, 21))
+    return f"""<div class="mmtw"><div class="shead" style="margin-top:18px"><div class="ttl">Daily sheet</div>
+<div class="seg mmrows" style="margin-bottom:8px">{btns}</div></div>
+<div class="card tscroll mm mmscroll"><table>
 <tr><th></th><th colspan="6" class="mm-h1">Primary breadth indicators</th>
 <th colspan="6" class="mm-h2">Secondary breadth indicators</th><th colspan="3"></th></tr>
 <tr><th>Date</th><th>Up 4%+<br>today</th><th>Down 4%+<br>today</th><th>5-day<br>ratio</th>
@@ -1336,16 +1522,19 @@ def _mm_table(mm, index, rows=30):
 <th>Up 25%+<br>in a month</th><th>Down 25%+<br>in a month</th><th>Up 50%+<br>in a month</th>
 <th>Down 50%+<br>in a month</th><th>Up 13%+<br>in 34 days</th><th>Down 13%+<br>in 34 days</th>
 <th>Stock<br>universe</th><th>T2108<br>(% &gt; 40 MA)</th><th>Nifty 50</th></tr>
-{''.join(body)}</table></div>"""
+{''.join(body)}</table></div></div>"""
 
 
-def _mm_tab(mm, nifty, cfg):
+def _mm_tab(monitors, nifty, cfg):
+    """monitors = [(dropdown label, mm frame, subtitle note)]; the first one shows by default."""
     tp = cfg.get("thrust_pctile", 90)
-    return f"""<div>
-<h2>Market Monitor</h2>
-<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet across all
-{int(mm['universe'].iloc[-1]):,} NSE stocks &middot; newest session first</p>
-{_mm_read(mm, tp)}{_mm_table(mm, nifty, cfg.get("rows", 30))}
+    sel, blocks = _switch([(label, f"""<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet
+across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session first</p>
+{_mm_read(mm, tp)}{_mm_chart(mm, nifty)}{_mm_table(mm, nifty, cfg.get("rows", 252))}""")
+                           for label, mm, note in monitors])
+    return f"""<div class="uwrap">
+<div class="shead"><h2>Monitor</h2>{sel}</div>
+{blocks}
 <div class="note"><b>Up / down 4%+ today</b>: closed 4% or more above / below yesterday on
 volume higher than yesterday's and at least {cfg.get('min_volume', 100000):,} shares.
 <b>5 / 10-day ratio</b>: up-4% count &divide; down-4% count summed over 5 / 10 sessions
@@ -1486,7 +1675,7 @@ def build_dashboard(b, sec_df, universe, extras):
     isel, iblocks = _switch([(label, _market_internals(bb, extras.get("nifty")))
                              for label, bb in extras["internals"].items()])
     tabs = [("Market breadth", None)] + [(name, h) for name, h in
-                                         (("Market Monitor", extras.get("mm_html")),
+                                         (("Monitor", extras.get("mm_html")),
                                           ("IPO screener", extras.get("ipo_html")),
                                           ("RVOL screener", extras.get("rvol_html"))) if h]
     tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
@@ -1530,7 +1719,7 @@ Action lists use the {_esc(universe)} universe.</p>
 </div>
 {other_panes}
 </div>
-<script>{MB_JS}</script>"""
+<script>{MB_JS}{MM_JS}</script>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1587,10 +1776,36 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
 
     if monitor is not None:
         try:
-            mm = market_monitor(closes, volumes, monitor.get("min_volume", 100000),
-                                thrust_pctile=monitor.get("thrust_pctile", 90),
-                                lookback=monitor.get("lookback", 252))
-            extras["mm_html"] = _mm_tab(mm, extras["nifty"], monitor)
+            params = dict(min_volume=monitor.get("min_volume", 100000),
+                          thrust_pctile=monitor.get("thrust_pctile", 90),
+                          lookback=monitor.get("lookback", 252))
+            if monitor.get("universe", "full") != "full":
+                monitors = [("Nifty Total Market", market_monitor(closes, volumes, **params),
+                             " in the Nifty Total Market")]
+            else:
+                tickers, counts = fetch_full_market(
+                    bse_exclude=monitor.get("bse_exclude", ("Z", "M")))
+                extra = [t for t in tickers if t not in closes.columns]
+                print(f"Market Monitor universe: {counts['nse']:,} NSE + {counts['bse']:,} BSE-only "
+                      f"stocks ({len(extra):,} beyond the main download)")
+                xc, xv = (load_prices(extra, period=period, refresh=refresh, tag="fullmkt") if extra
+                          else (pd.DataFrame(index=closes.index), pd.DataFrame(index=closes.index)))
+                mm_c = pd.concat([closes, xc.reindex(closes.index)], axis=1)
+                mm_v = pd.concat([volumes, xv.reindex(closes.index)], axis=1)
+                mm_c = mm_c.loc[:, ~mm_c.columns.duplicated()]
+                mm_v = mm_v.loc[:, ~mm_v.columns.duplicated()]
+                nse_cols = [c for c in mm_c.columns if c.endswith(".NS")]
+                monitors = [("NSE only", market_monitor(mm_c[nse_cols], mm_v[nse_cols], **params),
+                             " listed on NSE (NSE Z category excluded)")]
+                if counts["bse"]:
+                    monitors.insert(0, ("NSE + BSE", market_monitor(mm_c, mm_v, **params),
+                                        f" on NSE + BSE ({len(nse_cols):,} NSE, "
+                                        f"{mm_c.shape[1] - len(nse_cols):,} BSE-only; "
+                                        f"Z-group and SME excluded)"))
+                else:
+                    monitors[0] = (monitors[0][0], monitors[0][1],
+                                   monitors[0][2].replace(")", "; BSE list unavailable today)"))
+            extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor)
         except Exception as e:
             print(f"  [warn] Market Monitor failed: {e}", file=sys.stderr)
             extras["mm_html"] = f'<div class="card note" style="margin-top:16px">Market Monitor failed: {_esc(e)}</div>'
@@ -1652,7 +1867,9 @@ IPO_SCREENER = dict(
 
 # Market Monitor tab - Stockbee breadth sheet (set to None to skip).
 MARKET_MONITOR = dict(
-    rows=30,                    # sessions shown, newest first
+    universe="full",            # full = every NSE + BSE main-board stock | total = Nifty Total Market
+    bse_exclude=("Z", "M"),     # BSE groups left out: Z = non-compliant, M / MT = SME
+    rows=252,                   # sessions in the daily sheet (1M shown first, expand to 1Y)
     min_volume=100000,          # shares; a 4% move only counts on at least this volume
     thrust_pctile=90,           # thrust day = 4% count in the top 10% of the last `lookback`
     lookback=252,               # sessions - NSE's own version of Stockbee's US "300"
