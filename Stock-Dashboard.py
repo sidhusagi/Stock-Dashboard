@@ -258,6 +258,52 @@ def compute_breadth(closes, min_stocks=20):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Stockbee Market Monitor (Pradeep Bonde's breadth sheet, NSE edition)
+# ---------------------------------------------------------------------------
+MM_RANGES = (  # (column, lookback sessions, move) - Stockbee's Telechart scans use min/max close
+    ("q25", 65, 0.25),   # 25%+ in a quarter
+    ("m25", 20, 0.25),   # 25%+ in a month
+    ("m50", 20, 0.50),   # 50%+ in a month
+    ("d34", 34, 0.13),   # 13%+ in 34 days
+)
+
+
+def market_monitor(closes, volumes, min_volume=100000, ma_days=40, thrust_pctile=90, lookback=252):
+    """One row per session with every column of the Stockbee Market Monitor.
+
+    Thrust levels are NSE's own: a buying (selling) thrust is an up-4% (down-4%) count in
+    the top `100 - thrust_pctile`% of the previous `lookback` sessions - as rare on NSE as
+    Stockbee's 300 is in the US. Today is not part of its own yardstick.
+
+    Up/down 4%: close >= 4% from yesterday on volume above yesterday's and at least
+    `min_volume` shares. Up X% in N days: close / lowest close of the last N sessions
+    >= 1 + X (down: close / highest close <= 1 - X). T2108: % of stocks above their
+    40-day simple moving average.
+    """
+    vol = volumes.reindex(index=closes.index, columns=closes.columns)
+    ret = closes / closes.shift(1) - 1
+    on_vol = (vol > vol.shift(1)) & (vol >= min_volume)
+    out = pd.DataFrame(index=closes.index)
+    out["universe"] = closes.notna().sum(axis=1)
+    out["up4"] = ((ret >= 0.04) & on_vol).sum(axis=1)
+    out["dn4"] = ((ret <= -0.04) & on_vol).sum(axis=1)
+    for col, thr in (("up4", "thr_up"), ("dn4", "thr_dn")):
+        out[thr] = np.ceil(out[col].shift(1).rolling(lookback, min_periods=120)
+                           .quantile(thrust_pctile / 100.0))
+    for days in (5, 10):
+        out[f"r{days}"] = (out["up4"].rolling(days).sum()
+                           / out["dn4"].rolling(days).sum().replace(0, np.nan))
+    for key, n, move in MM_RANGES:
+        lo = closes.rolling(n, min_periods=n).min()
+        hi = closes.rolling(n, min_periods=n).max()
+        out[f"{key}_up"] = (closes / lo >= 1 + move).sum(axis=1)
+        out[f"{key}_dn"] = (closes / hi <= 1 - move).sum(axis=1)
+    sma = closes.rolling(ma_days, min_periods=ma_days).mean()
+    out["t2108"] = (closes > sma).sum(axis=1) / sma.notna().sum(axis=1).replace(0, np.nan) * 100.0
+    return out.iloc[65:]   # first quarter has no 65-day lookback yet
+
+
+# ---------------------------------------------------------------------------
 # 5. Groupings - size segments and sectors
 # ---------------------------------------------------------------------------
 def segment_panels(closes):
@@ -774,6 +820,14 @@ border-bottom:2px solid transparent;background:none;color:var(--dim);cursor:poin
 .charts{display:grid;gap:16px}
 .chartcard{padding:10px;scroll-margin-top:12px}
 .chartcard img{width:100%;display:block}
+.mm td{padding:6px 9px;font-variant-numeric:tabular-nums}
+.mm th{text-align:center;vertical-align:bottom}
+.mm .mm-h1,.mm .mm-h2{font-size:12px;color:#111827;border-bottom:none;border-radius:6px 6px 0 0}
+.mm .mm-h1{background:#cffafe}.mm .mm-h2{background:#fef9c3}
+.mm td.mm-g{background:#bbf7d0}.mm td.mm-g2{background:#16a34a;color:#fff;font-weight:600}
+.mm td.mm-r{background:#f08080}.mm td.mm-p{background:#fde2e2}
+.mmread{margin-bottom:16px}
+.mmread .card{padding:14px 16px}
 """
 
 
@@ -1180,6 +1234,137 @@ def _sector_table(rows):
 each group, so they describe the average stock, not the index heavyweights.</div></div>"""
 
 
+def _mm_cell(v, cls="", dp=0):
+    txt = "&ndash;" if _missing(v) else (f"{v:,.{dp}f}" if dp else f"{int(v):,}")
+    return f'<td class="{cls}">{txt}</td>' if cls else f"<td>{txt}</td>"
+
+
+def _mm_pair(up, dn, thr_up=None, thr_dn=None):
+    """Stockbee colouring, as in his sheets.
+
+    More up than down: both cells green, the up cell dark green on a thrust day.
+    More down than up: both cells pink, the down cell red on a selling-thrust day.
+    Thrust levels only apply to the 4% columns; the longer-range pairs are just green / red.
+    """
+    if _missing(up) or _missing(dn) or up == dn:
+        return _mm_cell(up) + _mm_cell(dn)
+    if thr_up is None:
+        return (_mm_cell(up, "mm-g") + _mm_cell(dn, "mm-g")) if up > dn else \
+               (_mm_cell(up, "mm-r") + _mm_cell(dn, "mm-r"))
+    if up > dn:
+        hot = not _missing(thr_up) and up >= thr_up
+        return _mm_cell(up, "mm-g2" if hot else "mm-g") + _mm_cell(dn, "mm-g")
+    hot = not _missing(thr_dn) and dn >= thr_dn
+    return _mm_cell(up, "mm-p") + _mm_cell(dn, "mm-r" if hot else "mm-p")
+
+
+def _mm_streak(flags):
+    """Length of the run of True values ending on the last row."""
+    n = 0
+    for f in reversed(list(flags)):
+        if not f:
+            break
+        n += 1
+    return n
+
+
+def _mm_read(mm, pctile):
+    """Today's read: who dominates and for how long (Stockbee, 'Understand market breadth').
+
+    Fund buying shows up as day after day of more stocks up 4% than down 4%, with
+    back-to-back thrust days; fund selling is the mirror image. Breakouts follow through
+    when buying dominates and fail when selling does. The verdict rules are ours.
+    """
+    last = mm.iloc[-1]
+    buy, sell = mm["up4"] > mm["dn4"], mm["dn4"] > mm["up4"]
+    bthr = buy & (mm["up4"] >= mm["thr_up"])
+    sthr = sell & (mm["dn4"] >= mm["thr_dn"])
+    buy_run, sell_run = _mm_streak(buy), _mm_streak(sell)
+    b10, s10 = int(bthr.tail(10).sum()), int(sthr.tail(10).sum())
+    b2b_buy = bool((bthr & bthr.shift(1, fill_value=False)).tail(5).any())   # back-to-back thrusts
+    b2b_sell = bool((sthr & sthr.shift(1, fill_value=False)).tail(5).any())
+    r5, r10 = last["r5"], last["r10"]
+    ok = lambda v, f: not _missing(v) and f(v)
+    if ok(r5, lambda v: v >= 2) or (b2b_buy and not sthr.tail(5).any()) or \
+            (ok(r10, lambda v: v >= 1.5) and b10 >= 2 and s10 <= 1):
+        verdict, cls, msg = "Buying dominates", "ok", "Funds are buying. Breakouts tend to work and follow through."
+    elif ok(r5, lambda v: v <= 0.5) or (b2b_sell and not bthr.tail(5).any()) or \
+            (ok(r10, lambda v: v <= 0.67) and s10 >= 2 and b10 <= 1):
+        verdict, cls, msg = "Selling dominates", "bad", "Funds are selling. Breakouts tend to fail; protect capital."
+    else:
+        verdict, cls, msg = "Mixed", "amb", "Neither side in control. Breakouts are less reliable; be selective."
+    n, side = (buy_run, "buying") if buy_run else (sell_run, "selling") if sell_run else (0, "")
+    run_note = (f"day{'s' if n != 1 else ''} of {side} in a row (more stocks up 4% than down, or the reverse)"
+                if n else "as many stocks up 4% as down today")
+    tag = f'<span class="tag {cls}">{verdict}</span>' if cls != "amb" else \
+          f'<span class="tag" style="background:#fef3c7;color:#b45309">{verdict}</span>'
+    lvl = lambda v: "&ndash;" if _missing(v) else f"{int(v):,}"
+    return f"""<div class="grid g4 mmread">
+<div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}</div>
+<div class="note" style="margin:0">{msg}</div></div>
+<div class="card"><div class="ttl">Current run</div><div class="big">{n}</div>
+<div class="note" style="margin:0">{run_note}</div></div>
+<div class="card"><div class="ttl">Thrust days, last 10</div>
+<div class="big"><span class="pos">{b10}</span> <span class="dim" style="font-size:18px">vs</span> <span class="neg">{s10}</span></div>
+<div class="note" style="margin:0">NSE's &ldquo;300&rdquo; today: <b>{lvl(last['thr_up'])}+</b> up 4% for buying,
+<b>{lvl(last['thr_dn'])}+</b> down 4% for selling (top {100 - pctile:g}% of the last year)</div></div>
+<div class="card"><div class="ttl">5 / 10-day ratio</div>
+<div class="big">{_sgn(r5).lstrip('+') if not _missing(r5) else '&ndash;'} <span class="dim" style="font-size:18px">/ {_sgn(r10).lstrip('+') if not _missing(r10) else '&ndash;'}</span></div>
+<div class="note" style="margin:0">&ge; 2 = strong buying, &le; 0.5 = strong selling</div></div>
+</div>"""
+
+
+def _mm_table(mm, index, rows=30):
+    view = mm.tail(rows).iloc[::-1]
+    idx = index.reindex(view.index) if index is not None else pd.Series(np.nan, index=view.index)
+    body = []
+    for d, r in view.iterrows():
+        ratio = lambda v: _mm_cell(v, "mm-g" if v >= 2 else "mm-r" if v <= 0.5 else "", dp=2)
+        t = r["t2108"]
+        body.append(
+            f"<tr><td>{d:%d %b %Y}</td>" + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
+            + ratio(r["r5"]) + ratio(r["r10"])
+            + "".join(_mm_pair(r[f"{k}_up"], r[f"{k}_dn"]) for k, _, _ in MM_RANGES)
+            + _mm_cell(r["universe"])
+            + _mm_cell(t, "mm-g" if t <= 20 else "mm-r" if t >= 80 else "", dp=2)
+            + _mm_cell(idx.get(d), dp=2) + "</tr>")
+    return f"""<div class="card tscroll mm"><table>
+<tr><th></th><th colspan="6" class="mm-h1">Primary breadth indicators</th>
+<th colspan="6" class="mm-h2">Secondary breadth indicators</th><th colspan="3"></th></tr>
+<tr><th>Date</th><th>Up 4%+<br>today</th><th>Down 4%+<br>today</th><th>5-day<br>ratio</th>
+<th>10-day<br>ratio</th><th>Up 25%+<br>in a quarter</th><th>Down 25%+<br>in a quarter</th>
+<th>Up 25%+<br>in a month</th><th>Down 25%+<br>in a month</th><th>Up 50%+<br>in a month</th>
+<th>Down 50%+<br>in a month</th><th>Up 13%+<br>in 34 days</th><th>Down 13%+<br>in 34 days</th>
+<th>Stock<br>universe</th><th>T2108<br>(% &gt; 40 MA)</th><th>Nifty 50</th></tr>
+{''.join(body)}</table></div>"""
+
+
+def _mm_tab(mm, nifty, cfg):
+    tp = cfg.get("thrust_pctile", 90)
+    return f"""<div>
+<h2>Market Monitor</h2>
+<p class="secsub">Pradeep Bonde (Stockbee) style breadth sheet across all
+{int(mm['universe'].iloc[-1]):,} NSE stocks &middot; newest session first</p>
+{_mm_read(mm, tp)}{_mm_table(mm, nifty, cfg.get("rows", 30))}
+<div class="note"><b>Up / down 4%+ today</b>: closed 4% or more above / below yesterday on
+volume higher than yesterday's and at least {cfg.get('min_volume', 100000):,} shares.
+<b>5 / 10-day ratio</b>: up-4% count &divide; down-4% count summed over 5 / 10 sessions
+(&ge; 2 green, &le; 0.5 red).
+<b>Up / down X% in N days</b>: close vs the lowest / highest close of the last N sessions
+(quarter = 65, month = 20).
+<b>T2108</b>: % of stocks above their 40-day moving average (&le; 20 oversold, &ge; 80 overbought).
+Colours follow Stockbee's sheet: a 4% pair is green when more stocks rose than fell and pink
+when more fell; the up cell turns dark green (buying thrust) or the down cell red (selling thrust)
+when the count is in the top {100 - tp:g}% of the previous {cfg.get('lookback', 252)} sessions.
+That is NSE's version of his 300: a count rare enough that only funds can cause it. NSE stocks
+move 4% far more often than US stocks, so a fixed number or a straight share of the universe
+would not carry over. The longer-range pairs are green or red by which side is bigger.
+<b>Reading it</b>: funds can't hide. Day after day of buying, with back-to-back thrust days, is a
+breadth thrust &mdash; breakouts work and follow through. Day after day of selling is the mirror
+image. Use it to time breakouts, not to pick stocks.</div>
+</div>"""
+
+
 def _action_card(title, note, df, chip, n=8):
     head = (f'<div class="row"><span class="ttl">{_esc(title)}</span>'
             f'<span class="cnt">{len(df):,} stocks</span></div>'
@@ -1301,7 +1486,8 @@ def build_dashboard(b, sec_df, universe, extras):
     isel, iblocks = _switch([(label, _market_internals(bb, extras.get("nifty")))
                              for label, bb in extras["internals"].items()])
     tabs = [("Market breadth", None)] + [(name, h) for name, h in
-                                         (("IPO screener", extras.get("ipo_html")),
+                                         (("Market Monitor", extras.get("mm_html")),
+                                          ("IPO screener", extras.get("ipo_html")),
                                           ("RVOL screener", extras.get("rvol_html"))) if h]
     tabbar = "".join(f'<button class="tabbtn{" on" if i == 0 else ""}" data-t="{i}" onclick="{_TAB_JS}">'
                      f'{_esc(name)}</button>' for i, (name, _) in enumerate(tabs))
@@ -1361,7 +1547,7 @@ AD_UNIVERSES = (("Nifty Total Market", "TOTAL MARKET"), ("Nifty MidSmallcap 400"
 
 
 def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_dashboard.html",
-                  ipo=None, rvol=None):
+                  ipo=None, rvol=None, monitor=None):
     """Builds the dashboard, displays it in the notebook and writes the HTML file.
 
     `ipo` / `rvol` are screener settings dicts; None skips that tab.
@@ -1398,6 +1584,16 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
         "ad": {name: breadth_of(key) for name, key in AD_UNIVERSES if key in panels},
         "nifty": load_index("^NSEI", period=period, refresh=refresh),
     }
+
+    if monitor is not None:
+        try:
+            mm = market_monitor(closes, volumes, monitor.get("min_volume", 100000),
+                                thrust_pctile=monitor.get("thrust_pctile", 90),
+                                lookback=monitor.get("lookback", 252))
+            extras["mm_html"] = _mm_tab(mm, extras["nifty"], monitor)
+        except Exception as e:
+            print(f"  [warn] Market Monitor failed: {e}", file=sys.stderr)
+            extras["mm_html"] = f'<div class="card note" style="margin-top:16px">Market Monitor failed: {_esc(e)}</div>'
 
     for key, cfg, run, tab in (("ipo_html", ipo, lambda c: run_ipo_screener(**c), _ipo_tab),
                                ("rvol_html", rvol, lambda c: run_rvol_screener(symbols, **c), _rvol_tab)):
@@ -1454,6 +1650,14 @@ IPO_SCREENER = dict(
     max_charts=0,               # 0 = chart every match
 )
 
+# Market Monitor tab - Stockbee breadth sheet (set to None to skip).
+MARKET_MONITOR = dict(
+    rows=30,                    # sessions shown, newest first
+    min_volume=100000,          # shares; a 4% move only counts on at least this volume
+    thrust_pctile=90,           # thrust day = 4% count in the top 10% of the last `lookback`
+    lookback=252,               # sessions - NSE's own version of Stockbee's US "300"
+)
+
 # RVOL screener tab (set to None to skip). Same defaults as the RVOL notebook.
 RVOL_SCREENER = dict(
     min_rvol_pct=1000.0,        # 1000% = 10x the prior average volume
@@ -1475,4 +1679,4 @@ RVOL_SCREENER = dict(
 
 if __name__ == "__main__":
     run_dashboard(period=PERIOD, universe=UNIVERSE, refresh=REFRESH, output=OUTPUT_HTML,
-                  ipo=IPO_SCREENER, rvol=RVOL_SCREENER)
+                  ipo=IPO_SCREENER, rvol=RVOL_SCREENER, monitor=MARKET_MONITOR)
