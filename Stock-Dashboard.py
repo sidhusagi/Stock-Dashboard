@@ -1469,6 +1469,9 @@ def _mm_read(mm, pctile):
 </div>"""
 
 
+ON, HIDE = ' class="on"', ' style="display:none"'   # kept outside f-strings: Python < 3.12 forbids backslashes in them
+
+
 def _mm_chart(mm, nifty, days=252):
     """Skeleton + JSON for the stacked sentiment charts; MM_JS draws them."""
     view = mm.tail(days)
@@ -1485,7 +1488,7 @@ def _mm_chart(mm, nifty, days=252):
             "qu": arr(view["q25_up"], 0), "qd": arr(view["q25_dn"], 0),
             "t": arr(view["t2108"], 1), "s": [int(v) for v in reg["state"]]}
     payload = html.escape(json.dumps(data, allow_nan=False), quote=True)
-    rng = "".join(f'<button data-n="{n}"{" class=\"on\"" if n == 126 else ""}>{lab}</button>'
+    rng = "".join(f'<button data-n="{n}"{ON if n == 126 else ""}>{lab}</button>'
                   for lab, n in (("3M", 63), ("6M", 126), ("1Y", 252)))
     return f"""<div class="card mmc" data-d="{payload}">
 <div class="mtop"><div class="mminfo"></div><div class="seg mmrng">{rng}</div></div>
@@ -1504,13 +1507,13 @@ def _mm_table(mm, index, rows=252, show=21):
         ratio = lambda v: _mm_cell(v, "mm-g" if v >= 2 else "mm-r" if v <= 0.5 else "", dp=2)
         t = r["t2108"]
         body.append(
-            f'<tr data-i="{i}"{"" if i < show else " style=\"display:none\""}><td>{d:%d %b %Y}</td>' + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
+            f'<tr data-i="{i}"{"" if i < show else HIDE}><td>{d:%d %b %Y}</td>' + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
             + ratio(r["r5"]) + ratio(r["r10"])
             + "".join(_mm_pair(r[f"{k}_up"], r[f"{k}_dn"]) for k, _, _ in MM_RANGES)
             + _mm_cell(r["universe"])
             + _mm_cell(t, "mm-g" if t <= 20 else "mm-r" if t >= 80 else "", dp=2)
             + _mm_cell(idx.get(d), dp=2) + "</tr>")
-    btns = "".join(f'<button data-n="{n}"{" class=\"on\"" if n == show else ""}>{lab}</button>'
+    btns = "".join(f'<button data-n="{n}"{ON if n == show else ""}>{lab}</button>'
                    for lab, n in (("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252)) if n <= max(rows, 21))
     return f"""<div class="mmtw"><div class="shead" style="margin-top:18px"><div class="ttl">Daily sheet</div>
 <div class="seg mmrows" style="margin-bottom:8px">{btns}</div></div>
