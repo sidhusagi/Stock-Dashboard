@@ -310,64 +310,28 @@ def market_monitor(closes, volumes, min_volume=100000, ma_days=40, thrust_pctile
         out[f"{key}_dn"] = (closes / hi <= 1 - move).sum(axis=1)
     sma = closes.rolling(ma_days, min_periods=ma_days).mean()
     out["t2108"] = (closes > sma).sum(axis=1) / sma.notna().sum(axis=1).replace(0, np.nan) * 100.0
+    # NSE's own "normal" for the ratios: on NSE more stocks rise 4% than fall on most days,
+    # so Stockbee's fixed 2 / 0.5 would read nearly every day as strong buying.
+    for days in (5, 10):
+        past = out[f"r{days}"].shift(1).rolling(lookback, min_periods=120)
+        out[f"r{days}_hi"], out[f"r{days}_lo"] = past.quantile(0.8), past.quantile(0.2)
+        out[f"r{days}_med"] = past.median()
     return out.iloc[65:]   # first quarter has no 65-day lookback yet
 
 
-BSE_SCRIPS_URL = ("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
-                  "?Group=&Scripcode=&industry=&segment=Equity&status=Active")
+def fetch_nse_equities(series=("EQ", "BE")):
+    """Every NSE main-board stock as yfinance tickers: EQ (normal) and BE (trade-for-trade).
 
-
-def _pick(row, *names):
-    """Value of the first matching key, ignoring case and spaces (the BSE API renames fields)."""
-    norm = {k.replace(" ", "").replace("_", "").lower(): v for k, v in row.items()}
-    for n in names:
-        v = norm.get(n.replace(" ", "").replace("_", "").lower())
-        if v not in (None, ""):
-            return str(v).strip()
-    return ""
-
-
-def fetch_full_market(nse_series=("EQ", "BE"), bse_exclude=("Z", "M")):
-    """(tickers, counts) for every active NSE + BSE main-board stock, each company once.
-
-    NSE: all symbols in the listed series (EQ = normal, BE = trade-for-trade; BZ, the
-    NSE Z category, is left out). BSE: every active equity scrip whose ISIN is not
-    already on NSE, minus groups starting with `bse_exclude` (Z = non-compliant,
-    M / MT = SME). If the BSE list can't be fetched we carry on with NSE only.
+    BZ, the NSE Z category, and the SME platform are left out.
     """
     resp = _nse_session().get(EQUITY_LIST_CSV_URL, timeout=30)
     resp.raise_for_status()
-    nse, isins = [], set()
+    out = set()
     for raw in csv.DictReader(io.StringIO(resp.text)):
         row = {k.strip(): (v or "").strip() for k, v in raw.items() if k}
-        if row.get("SERIES") in nse_series and row.get("SYMBOL"):
-            nse.append(f"{row['SYMBOL']}.NS")
-            isins.add(row.get("ISIN NUMBER", ""))
-    bse = []
-    try:
-        r = requests.get(BSE_SCRIPS_URL, timeout=60, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com",
-            "Accept": "application/json, text/plain, */*"})
-        r.raise_for_status()
-        rows = r.json()
-        rows = rows.get("Table", rows) if isinstance(rows, dict) else rows
-        for row in rows:
-            code = _pick(row, "SCRIP_CD", "Scrip_Code", "scripcode")
-            group = _pick(row, "GROUP", "Group", "Scrip_Group").upper()
-            isin = _pick(row, "ISIN_NUMBER", "ISIN", "ISIN No")
-            if not code.isdigit() or (isin and isin in isins):
-                continue
-            if any(group.startswith(g) for g in bse_exclude):
-                continue
-            bse.append(f"{code}.BO")
-            if isin:
-                isins.add(isin)
-    except Exception as e:
-        print(f"  [warn] BSE scrip list unavailable ({e}); Market Monitor uses NSE stocks only",
-              file=sys.stderr)
-    return sorted(set(nse)) + sorted(set(bse)), {"nse": len(set(nse)), "bse": len(set(bse))}
+        if row.get("SERIES") in series and row.get("SYMBOL"):
+            out.add(f"{row['SYMBOL']}.NS")
+    return sorted(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1181,7 @@ function fd(s){var p=s.split('-');return (+p[2])+' '+MON[+p[1]-1]+' '+p[0];}
 function fn(v,dp){return ok(v)?v.toLocaleString('en-IN',{minimumFractionDigits:dp||0,maximumFractionDigits:dp||0}):'\u2013';}
 function info(box,D,i){var s=D.s[i],tag=s>0?['Buying dominates','pos']:s<0?['Selling dominates','neg']:['Mixed','amb'];
  box.querySelector('.mminfo').innerHTML='<b>'+fd(D.d[i])+'</b> &middot; <b class="'+tag[1]+'">'+tag[0]+'</b>'
+  +(ok(D.sc[i])?' <span class="dim">(score '+fn(D.sc[i])+')</span>':'')
   +' &middot; Nifty '+fn(D.ix[i],0)+' &middot; up 4% <b class="pos">'+fn(D.up[i])+'</b> / down 4% <b class="neg">'+fn(D.dn[i])+'</b>'
   +' <span class="dim">(thrust '+fn(D.tu[i])+' / '+fn(D.td[i])+')</span> &middot; 5d '+fn(D.r5[i],2)+' &middot; 10d '+fn(D.r10[i],2)
   +' &middot; T2108 '+fn(D.t[i],1);}
@@ -1405,67 +1370,86 @@ def _mm_streak(flags):
     return n
 
 
-def mm_regime(mm):
-    """Day-by-day verdict: +1 buying dominates, -1 selling dominates, 0 mixed (our rules).
+def _prank(x, n=252, min_n=120):
+    """Percentile rank (0-1) of each value against the previous `n` values."""
+    def rank(a):
+        past, now = a[:-1], a[-1]
+        past = past[~np.isnan(past)]
+        if np.isnan(now) or len(past) < min_n:
+            return np.nan
+        return ((past < now).sum() + 0.5 * (past == now).sum()) / len(past)
+    return x.rolling(n + 1, min_periods=min_n + 1).apply(rank, raw=True)
 
-    Buying: 5-day ratio >= 2, or back-to-back buying-thrust days in the last 5 sessions with
-    no selling thrust, or 10-day ratio >= 1.5 with 2+ buying thrusts and at most 1 selling
-    thrust in the last 10. Selling is the mirror image.
+
+def mm_regime(mm, lookback=252):
+    """Day-by-day sentiment: score 0-100 and verdict +1 buying / -1 selling / 0 mixed (our rules).
+
+    Every part is ranked against its own previous year, because NSE breadth is lopsided
+    (more stocks rise 4% than fall on most days) and fixed US levels don't carry over:
+      1. 4% balance   - up-4% vs down-4% counts over 10 sessions
+      2. T2108 level  - % of stocks above their 40-day average
+      3. T2108 trend  - its change over 10 sessions
+      4. Primary trend - change over 10 sessions in (up 25% - down 25%) / (up + down) in a quarter
+    Score = average rank x 100. 60+ = buying dominates, 40 or less = selling dominates.
+    The two trend parts catch a market that is slipping while many small stocks still rise.
     """
+    bal = np.log((mm["up4"].rolling(10).sum() + 10) / (mm["dn4"].rolling(10).sum() + 10))
+    prim = (mm["q25_up"] - mm["q25_dn"]) / (mm["q25_up"] + mm["q25_dn"]).replace(0, np.nan)
+    parts = pd.DataFrame({"bal": _prank(bal, lookback), "t2108": _prank(mm["t2108"], lookback),
+                          "t2108_trend": _prank(mm["t2108"].diff(10), lookback),
+                          "prim_trend": _prank(prim.diff(10), lookback)}, index=mm.index)
+    score = parts.mean(axis=1, skipna=False) * 100
+    state = pd.Series(np.where(score >= 60, 1, np.where(score <= 40, -1, 0)), index=mm.index)
     buy, sell = mm["up4"] > mm["dn4"], mm["dn4"] > mm["up4"]
     bthr = (buy & (mm["up4"] >= mm["thr_up"])).astype(int)
     sthr = (sell & (mm["dn4"] >= mm["thr_dn"])).astype(int)
-    roll = lambda x, n: x.rolling(n, min_periods=1)
-    b10, s10 = roll(bthr, 10).sum(), roll(sthr, 10).sum()
-    b2b_buy = roll(bthr & bthr.shift(1, fill_value=0), 5).max() > 0
-    b2b_sell = roll(sthr & sthr.shift(1, fill_value=0), 5).max() > 0
-    b5, s5 = roll(bthr, 5).max() > 0, roll(sthr, 5).max() > 0
-    buying = (mm["r5"] >= 2) | (b2b_buy & ~s5) | ((mm["r10"] >= 1.5) & (b10 >= 2) & (s10 <= 1))
-    selling = ~buying & ((mm["r5"] <= 0.5) | (b2b_sell & ~b5) | ((mm["r10"] <= 0.67) & (s10 >= 2) & (b10 <= 1)))
-    return pd.DataFrame({"state": buying.astype(int) - selling.astype(int),
-                         "buy": buy, "sell": sell, "b10": b10, "s10": s10}, index=mm.index)
+    return pd.concat([parts * 100, pd.DataFrame({
+        "score": score, "state": state.where(score.notna(), 0).astype(int),
+        "b10": bthr.rolling(10, min_periods=1).sum(), "s10": sthr.rolling(10, min_periods=1).sum()},
+        index=mm.index)], axis=1)
 
 
 def _mm_read(mm, pctile):
-    """Today's read: who dominates and for how long (Stockbee, 'Understand market breadth').
-
-    Fund buying shows up as day after day of more stocks up 4% than down 4%, with
-    back-to-back thrust days; fund selling is the mirror image. Breakouts follow through
-    when buying dominates and fail when selling does. The verdict rules are ours.
-    """
+    """Today's read: sentiment verdict, its score and parts, thrust days and the ratios."""
     last = mm.iloc[-1]
     reg = mm_regime(mm)
-    buy_run, sell_run = _mm_streak(reg["buy"]), _mm_streak(reg["sell"])
-    b10, s10 = int(reg["b10"].iloc[-1]), int(reg["s10"].iloc[-1])
+    now = reg.iloc[-1]
+    b10, s10 = int(now["b10"]), int(now["s10"])
     r5, r10 = last["r5"], last["r10"]
-    state = reg["state"].iloc[-1]
-    # how long the current verdict has held - the "change in sentiment" date
-    since = reg.index[-_mm_streak(reg["state"] == state)]
+    state = int(now["state"])
+    since = reg.index[-_mm_streak(reg["state"] == state)]   # when sentiment last changed
     if state > 0:
         verdict, cls, msg = "Buying dominates", "ok", "Funds are buying. Breakouts tend to work and follow through."
     elif state < 0:
         verdict, cls, msg = "Selling dominates", "bad", "Funds are selling. Breakouts tend to fail; protect capital."
     else:
         verdict, cls, msg = "Mixed", "amb", "Neither side in control. Breakouts are less reliable; be selective."
-    n, side = (buy_run, "buying") if buy_run else (sell_run, "selling") if sell_run else (0, "")
-    run_note = (f"day{'s' if n != 1 else ''} of {side} in a row (more stocks up 4% than down, or the reverse)"
-                if n else "as many stocks up 4% as down today")
     tag = f'<span class="tag {cls}">{verdict}</span>' if cls != "amb" else \
           f'<span class="tag" style="background:#fef3c7;color:#b45309">{verdict}</span>'
     lvl = lambda v: "&ndash;" if _missing(v) else f"{int(v):,}"
+    num = lambda v, dp=2: "&ndash;" if _missing(v) else f"{v:.{dp}f}"
+    part = lambda k, lab: (f'<div class="row"><span class="dim">{lab}</span>'
+                           f'<b class="{"pos" if now[k] >= 60 else "neg" if now[k] <= 40 else ""}">'
+                           f'{num(now[k], 0)}</b></div>')
+    sc = now["score"]
     return f"""<div class="grid g4 mmread">
 <div class="card"><div class="ttl">Today's read</div><div style="margin:10px 0 6px">{tag}
 <span class="cnt">since {since:%d %b}</span></div>
 <div class="note" style="margin:0">{msg}</div></div>
-<div class="card"><div class="ttl">Current run</div><div class="big">{n}</div>
-<div class="note" style="margin:0">{run_note}</div></div>
+<div class="card"><div class="ttl">Sentiment score</div>
+<div class="big {"pos" if state > 0 else "neg" if state < 0 else "amb"}">{num(sc, 0)}
+<span class="dim" style="font-size:14px;font-weight:400">/ 100</span></div>
+<div class="note" style="margin:0 0 4px">60+ buying &middot; 40 or less selling &middot; each part ranked vs its past year</div>
+{part("bal", "4% balance, 10 days")}{part("t2108", "T2108 level")}
+{part("t2108_trend", "T2108 trend")}{part("prim_trend", "Primary trend")}</div>
 <div class="card"><div class="ttl">Thrust days, last 10</div>
 <div class="big"><span class="pos">{b10}</span> <span class="dim" style="font-size:18px">vs</span> <span class="neg">{s10}</span></div>
 <div class="note" style="margin:0">Today's &ldquo;300&rdquo;: <b>{lvl(last['thr_up'])}+</b> up 4% for buying,
 <b>{lvl(last['thr_dn'])}+</b> down 4% for selling (top {100 - pctile:g}% of the last year)</div></div>
 <div class="card"><div class="ttl">5 / 10-day ratio</div>
-<div class="big">{_sgn(r5).lstrip('+') if not _missing(r5) else '&ndash;'} <span class="dim" style="font-size:18px">/ {_sgn(r10).lstrip('+') if not _missing(r10) else '&ndash;'}</span></div>
-<div class="note" style="margin:0">&ge; 2 = strong buying, &le; 0.5 = strong selling</div></div>
+<div class="big">{num(r5)} <span class="dim" style="font-size:18px">/ {num(r10)}</span></div>
+<div class="note" style="margin:0">NSE's normal is about <b>{num(last['r5_med'], 1)}</b> / <b>{num(last['r10_med'], 1)}</b>.
+Strong buying &ge; {num(last['r5_hi'], 1)}, strong selling &le; {num(last['r5_lo'], 1)} (5-day, top / bottom 20% of the last year)</div></div>
 </div>"""
 
 
@@ -1486,7 +1470,8 @@ def _mm_chart(mm, nifty, days=252):
             "tu": arr(view["thr_up"], 0), "td": arr(view["thr_dn"], 0),
             "r5": arr(view["r5"]), "r10": arr(view["r10"]),
             "qu": arr(view["q25_up"], 0), "qd": arr(view["q25_dn"], 0),
-            "t": arr(view["t2108"], 1), "s": [int(v) for v in reg["state"]]}
+            "t": arr(view["t2108"], 1), "s": [int(v) for v in reg["state"]],
+            "sc": arr(reg["score"], 0)}
     payload = html.escape(json.dumps(data, allow_nan=False), quote=True)
     rng = "".join(f'<button data-n="{n}"{ON if n == 126 else ""}>{lab}</button>'
                   for lab, n in (("3M", 63), ("6M", 126), ("1Y", 252)))
@@ -1504,11 +1489,12 @@ def _mm_table(mm, index, rows=252, show=21):
     idx = index.reindex(view.index) if index is not None else pd.Series(np.nan, index=view.index)
     body = []
     for i, (d, r) in enumerate(view.iterrows()):
-        ratio = lambda v: _mm_cell(v, "mm-g" if v >= 2 else "mm-r" if v <= 0.5 else "", dp=2)
+        ratio = lambda v, hi, lo: _mm_cell(v, "mm-g" if not _missing(hi) and v >= hi else
+                                           "mm-r" if not _missing(lo) and v <= lo else "", dp=2)
         t = r["t2108"]
         body.append(
             f'<tr data-i="{i}"{"" if i < show else HIDE}><td>{d:%d %b %Y}</td>' + _mm_pair(r["up4"], r["dn4"], r["thr_up"], r["thr_dn"])
-            + ratio(r["r5"]) + ratio(r["r10"])
+            + ratio(r["r5"], r["r5_hi"], r["r5_lo"]) + ratio(r["r10"], r["r10_hi"], r["r10_lo"])
             + "".join(_mm_pair(r[f"{k}_up"], r[f"{k}_dn"]) for k, _, _ in MM_RANGES)
             + _mm_cell(r["universe"])
             + _mm_cell(t, "mm-g" if t <= 20 else "mm-r" if t >= 80 else "", dp=2)
@@ -1540,8 +1526,9 @@ across {int(mm['universe'].iloc[-1]):,} stocks{note} &middot; newest session fir
 {blocks}
 <div class="note"><b>Up / down 4%+ today</b>: closed 4% or more above / below yesterday on
 volume higher than yesterday's and at least {cfg.get('min_volume', 100000):,} shares.
-<b>5 / 10-day ratio</b>: up-4% count &divide; down-4% count summed over 5 / 10 sessions
-(&ge; 2 green, &le; 0.5 red).
+<b>5 / 10-day ratio</b>: up-4% count &divide; down-4% count summed over 5 / 10 sessions; green
+when in the top 20% of the last year, red in the bottom 20%. (On NSE more stocks rise 4% than fall
+on most days, so Stockbee's fixed 2 and 0.5 would show nearly every day as strong buying.)
 <b>Up / down X% in N days</b>: close vs the lowest / highest close of the last N sessions
 (quarter = 65, month = 20).
 <b>T2108</b>: % of stocks above their 40-day moving average (&le; 20 oversold, &ge; 80 overbought).
@@ -1551,6 +1538,10 @@ when the count is in the top {100 - tp:g}% of the previous {cfg.get('lookback', 
 That is NSE's version of his 300: a count rare enough that only funds can cause it. NSE stocks
 move 4% far more often than US stocks, so a fixed number or a straight share of the universe
 would not carry over. The longer-range pairs are green or red by which side is bigger.
+<b>Sentiment score / background colour</b>: the average of four parts, each ranked 0&ndash;100
+against its own last year &mdash; the 10-day 4% balance, T2108, T2108's 10-day change and the
+10-day change in the quarter's up-25% vs down-25% balance. 60+ = buying dominates, 40 or less =
+selling dominates. These rules are ours, built on Stockbee's indicators.
 <b>Reading it</b>: funds can't hide. Day after day of buying, with back-to-back thrust days, is a
 breadth thrust &mdash; breakouts work and follow through. Day after day of selling is the mirror
 image. Use it to time breakouts, not to pick stocks.</div>
@@ -1782,32 +1773,22 @@ def run_dashboard(period="2y", universe="all", refresh=False, output="breadth_da
             params = dict(min_volume=monitor.get("min_volume", 100000),
                           thrust_pctile=monitor.get("thrust_pctile", 90),
                           lookback=monitor.get("lookback", 252))
-            if monitor.get("universe", "full") != "full":
-                monitors = [("Nifty Total Market", market_monitor(closes, volumes, **params),
-                             " in the Nifty Total Market")]
-            else:
-                tickers, counts = fetch_full_market(
-                    bse_exclude=monitor.get("bse_exclude", ("Z", "M")))
+            total = ("Nifty 750", market_monitor(closes, volumes, **params),
+                     " in the Nifty Total Market (the Nifty 750)")
+            monitors = [total]
+            if monitor.get("universe", "full") == "full":
+                tickers = fetch_nse_equities()
                 extra = [t for t in tickers if t not in closes.columns]
-                print(f"Market Monitor universe: {counts['nse']:,} NSE + {counts['bse']:,} BSE-only "
-                      f"stocks ({len(extra):,} beyond the main download)")
+                print(f"Monitor universe: {len(tickers):,} NSE stocks "
+                      f"({len(extra):,} beyond the Nifty 750 download)")
                 xc, xv = (load_prices(extra, period=period, refresh=refresh, tag="fullmkt") if extra
                           else (pd.DataFrame(index=closes.index), pd.DataFrame(index=closes.index)))
                 mm_c = pd.concat([closes, xc.reindex(closes.index)], axis=1)
                 mm_v = pd.concat([volumes, xv.reindex(closes.index)], axis=1)
                 mm_c = mm_c.loc[:, ~mm_c.columns.duplicated()]
                 mm_v = mm_v.loc[:, ~mm_v.columns.duplicated()]
-                nse_cols = [c for c in mm_c.columns if c.endswith(".NS")]
-                monitors = [("NSE only", market_monitor(mm_c[nse_cols], mm_v[nse_cols], **params),
-                             " listed on NSE (NSE Z category excluded)")]
-                if counts["bse"]:
-                    monitors.insert(0, ("NSE + BSE", market_monitor(mm_c, mm_v, **params),
-                                        f" on NSE + BSE ({len(nse_cols):,} NSE, "
-                                        f"{mm_c.shape[1] - len(nse_cols):,} BSE-only; "
-                                        f"Z-group and SME excluded)"))
-                else:
-                    monitors[0] = (monitors[0][0], monitors[0][1],
-                                   monitors[0][2].replace(")", "; BSE list unavailable today)"))
+                monitors.insert(0, ("All NSE stocks", market_monitor(mm_c, mm_v, **params),
+                                    " listed on NSE (main board; Z category and SME excluded)"))
             extras["mm_html"] = _mm_tab(monitors, extras["nifty"], monitor)
         except Exception as e:
             print(f"  [warn] Market Monitor failed: {e}", file=sys.stderr)
@@ -1870,8 +1851,8 @@ IPO_SCREENER = dict(
 
 # Market Monitor tab - Stockbee breadth sheet (set to None to skip).
 MARKET_MONITOR = dict(
-    universe="full",            # full = every NSE + BSE main-board stock | total = Nifty Total Market
-    bse_exclude=("Z", "M"),     # BSE groups left out: Z = non-compliant, M / MT = SME
+    universe="full",            # full = All NSE stocks (default) + Nifty 750 in the dropdown
+                                # total = Nifty 750 only (faster: no extra download)
     rows=252,                   # sessions in the daily sheet (1M shown first, expand to 1Y)
     min_volume=100000,          # shares; a 4% move only counts on at least this volume
     thrust_pctile=90,           # thrust day = 4% count in the top 10% of the last `lookback`
